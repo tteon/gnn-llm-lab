@@ -54,6 +54,12 @@ pcst = [
     "pcst-fast>=1.0.7",
 ]
 
+# Evaluation metrics
+eval = [
+    "rouge-score>=0.1.2",
+    "bert-score>=0.3.13",
+]
+
 # Development dependencies
 dev = [
     "pytest>=7.0.0",
@@ -66,7 +72,7 @@ dev = [
 
 # All dependencies
 all = [
-    "gnnllm-lab[ml,quantization,pcst,dev]",
+    "gnnllm-lab[ml,quantization,pcst,eval,dev]",
 ]
 
 [project.urls]

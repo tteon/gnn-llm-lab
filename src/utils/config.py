@@ -187,12 +187,147 @@ class ModelConfig:
         return self
 
 
+
+
+@dataclass
+class AttentionConfig:
+    """Configuration for attention score extraction."""
+    enabled: bool = True
+    layers_to_extract: List[int] = field(default_factory=lambda: [-1, -2, -3])
+    aggregate_heads: str = "mean"  # "mean" | "max"
+    save_context_attention_only: bool = True
+    top_k_tokens: int = 50
+    output_dir: str = "results/attention"
+
+    def validate(self) -> "AttentionConfig":
+        if self.aggregate_heads not in ("mean", "max"):
+            raise ConfigurationError(
+                "aggregate_heads must be 'mean' or 'max'",
+                field="aggregate_heads",
+                value=self.aggregate_heads,
+            )
+        if self.top_k_tokens <= 0:
+            raise ConfigurationError("top_k_tokens must be positive", field="top_k_tokens")
+        self.output_dir = str(_validate_path(self.output_dir, create_parents=True))
+        return self
+
+
+@dataclass
+class FewShotConfig:
+    """Configuration for few-shot example selection."""
+    enabled: bool = False
+    num_examples_per_category: int = 1
+    include_graph_context: bool = False
+    selection_strategy: str = "representative"  # centroid-nearest
+    cache_path: str = "data/processed/few_shot_examples.json"
+
+    def validate(self) -> "FewShotConfig":
+        if self.num_examples_per_category <= 0:
+            raise ConfigurationError(
+                "num_examples_per_category must be positive",
+                field="num_examples_per_category",
+            )
+        if self.selection_strategy not in ("representative", "random"):
+            raise ConfigurationError(
+                "selection_strategy must be 'representative' or 'random'",
+                field="selection_strategy",
+                value=self.selection_strategy,
+            )
+        return self
+
+
+@dataclass
+class TrainingConfig:
+    """Configuration for GNN/KGE link prediction training."""
+
+    # Training hyperparameters
+    epochs: int = 200
+    learning_rate: float = 0.001
+    weight_decay: float = 1e-5
+    batch_size: int = 512
+    patience: int = 15
+    min_delta: float = 0.001
+
+    # Model selection
+    gnn_model_type: str = "gat"    # "gat" | "gcn" | "graph_transformer"
+    kge_model_type: str = "transe"  # "transe" | "distmult" | "complex" | "rotate"
+
+    # Dimensions
+    hidden_dim: int = 256
+    output_dim: int = 384
+
+    # GNN-specific
+    gnn_num_layers: int = 2
+    gnn_heads: int = 4
+    gnn_dropout: float = 0.1
+    decoder_type: str = "dot"  # "dot" | "mlp"
+
+    # KGE-specific
+    kge_margin: float = 1.0
+    kge_p_norm: float = 1.0
+
+    # Data split
+    val_ratio: float = 0.1
+    test_ratio: float = 0.1
+
+    # Checkpoint
+    checkpoint_dir: str = "results/checkpoints"
+    device: str = "auto"
+    seed: int = 42
+
+    def validate(self) -> "TrainingConfig":
+        """Validate configuration values."""
+        self.device = _validate_device(self.device)
+
+        if self.epochs <= 0:
+            raise ConfigurationError("epochs must be positive", field="epochs")
+        if self.learning_rate <= 0:
+            raise ConfigurationError("learning_rate must be positive", field="learning_rate")
+        if self.patience <= 0:
+            raise ConfigurationError("patience must be positive", field="patience")
+
+        valid_gnn = {"gat", "gcn", "graph_transformer"}
+        if self.gnn_model_type not in valid_gnn:
+            raise ConfigurationError(
+                f"gnn_model_type must be one of {valid_gnn}",
+                field="gnn_model_type",
+                value=self.gnn_model_type,
+            )
+
+        valid_kge = {"transe", "distmult", "complex", "rotate"}
+        if self.kge_model_type not in valid_kge:
+            raise ConfigurationError(
+                f"kge_model_type must be one of {valid_kge}",
+                field="kge_model_type",
+                value=self.kge_model_type,
+            )
+
+        valid_decoder = {"dot", "mlp"}
+        if self.decoder_type not in valid_decoder:
+            raise ConfigurationError(
+                f"decoder_type must be one of {valid_decoder}",
+                field="decoder_type",
+                value=self.decoder_type,
+            )
+
+        if self.gnn_dropout < 0 or self.gnn_dropout > 1:
+            raise ConfigurationError("gnn_dropout must be between 0 and 1", field="gnn_dropout")
+        if self.val_ratio < 0 or self.val_ratio > 0.5:
+            raise ConfigurationError("val_ratio must be between 0 and 0.5", field="val_ratio")
+        if self.test_ratio < 0 or self.test_ratio > 0.5:
+            raise ConfigurationError("test_ratio must be between 0 and 0.5", field="test_ratio")
+
+        self.checkpoint_dir = str(_validate_path(self.checkpoint_dir, create_parents=True))
+        return self
+
 @dataclass
 class ExperimentConfig:
     """Complete experiment configuration."""
     # Nested configs
     neo4j: Neo4jConfig = field(default_factory=Neo4jConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    attention: AttentionConfig = field(default_factory=AttentionConfig)
+    few_shot: FewShotConfig = field(default_factory=FewShotConfig)
 
     # Data settings
     parquet_path: str = "data/raw/FinDER_KG_Merged.parquet"
@@ -220,6 +355,16 @@ class ExperimentConfig:
     include_node_properties: bool = True
     include_edge_types: bool = True
 
+    # 3-axis experiment matrix
+    model_aliases: List[str] = field(default_factory=lambda: ["llama8b"])
+    context_conditions: List[str] = field(
+        default_factory=lambda: ["none", "lpg", "rdf", "lpg_rdf"]
+    )
+
+    # Evaluation settings
+    eval_bertscore: bool = True
+    eval_rouge: bool = True
+
     # Reproducibility
     seed: Optional[int] = 42
 
@@ -232,6 +377,8 @@ class ExperimentConfig:
         # Validate nested configs
         self.neo4j.validate()
         self.model.validate()
+        self.attention.validate()
+        self.few_shot.validate()
 
         # Validate paths
         self.cache_dir = str(_validate_path(self.cache_dir, create_parents=True))
@@ -251,6 +398,16 @@ class ExperimentConfig:
             raise ConfigurationError("batch_size must be positive", field="batch_size")
         if self.checkpoint_interval <= 0:
             raise ConfigurationError("checkpoint_interval must be positive", field="checkpoint_interval")
+
+        # Validate context conditions
+        valid_contexts = {"none", "lpg", "rdf", "lpg_rdf"}
+        for ctx in self.context_conditions:
+            if ctx not in valid_contexts:
+                raise ConfigurationError(
+                    f"Invalid context condition '{ctx}', must be one of {valid_contexts}",
+                    field="context_conditions",
+                    value=ctx,
+                )
 
         # Validate log level
         valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -283,6 +440,17 @@ class ExperimentConfig:
                 "gnn_num_layers": self.model.gnn_num_layers,
                 "device": self.model.device,
             },
+            "attention": {
+                "enabled": self.attention.enabled,
+                "layers_to_extract": self.attention.layers_to_extract,
+                "aggregate_heads": self.attention.aggregate_heads,
+                "top_k_tokens": self.attention.top_k_tokens,
+            },
+            "few_shot": {
+                "enabled": self.few_shot.enabled,
+                "num_examples_per_category": self.few_shot.num_examples_per_category,
+                "selection_strategy": self.few_shot.selection_strategy,
+            },
             "experiment": {
                 "top_k_nodes": self.top_k_nodes,
                 "max_hops": self.max_hops,
@@ -290,6 +458,10 @@ class ExperimentConfig:
                 "temperature": self.temperature,
                 "soft_prompt_format": self.soft_prompt_format,
                 "seed": self.seed,
+                "model_aliases": self.model_aliases,
+                "context_conditions": self.context_conditions,
+                "eval_bertscore": self.eval_bertscore,
+                "eval_rouge": self.eval_rouge,
             },
         }
 
@@ -298,11 +470,17 @@ class ExperimentConfig:
         """Create config from dictionary."""
         neo4j = Neo4jConfig(**data.get("neo4j", {}))
         model = ModelConfig(**data.get("model", {}))
+        attention_data = data.get("attention", {})
+        attention = AttentionConfig(**attention_data) if attention_data else AttentionConfig()
+        few_shot_data = data.get("few_shot", {})
+        few_shot = FewShotConfig(**few_shot_data) if few_shot_data else FewShotConfig()
         experiment_data = data.get("experiment", {})
 
         return cls(
             neo4j=neo4j,
             model=model,
+            attention=attention,
+            few_shot=few_shot,
             **experiment_data
         )
 

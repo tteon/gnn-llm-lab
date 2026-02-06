@@ -1,14 +1,27 @@
 """
-Local experiment runner for GNN+LLM Graph RAG comparison.
+3-Axis GraphRAG comparison experiment runner.
 
-Runs 4 experiments using remote LLM API + local Neo4j + local GNN models:
-  [A] LLM Only      — question → LLM API → answer
-  [B] Text RAG      — question + references → LLM API → answer
-  [C] Graph LPG     — subgraph → GAT → text context → LLM API → answer
-  [D] Graph RDF     — triples → TransE → text context → LLM API → answer
+Runs a full experiment matrix across:
+  - Model axis: Dense/Sparse(MoE) models via local HuggingFace loading
+  - Context axis: none / LPG / RDF / LPG+RDF
+  - Few-shot axis: zero-shot / category-representative few-shot
+
+With attention score extraction and comprehensive evaluation metrics.
 
 Usage:
-    uv run python src/run_experiment.py --sample-size 50 --experiments llm text_rag graph_lpg graph_rdf
+    # Full matrix
+    uv run python src/run_experiment.py \\
+        --models llama8b llama70b mixtral qwen_moe \\
+        --contexts none lpg rdf lpg_rdf \\
+        --few-shot --sample-size 50
+
+    # Quick smoke test
+    uv run python src/run_experiment.py \\
+        --models llama8b --contexts none lpg --sample-size 2 --no-bertscore
+
+    # Legacy compatibility
+    uv run python src/run_experiment.py \\
+        --experiments llm text_rag graph_lpg graph_rdf --sample-size 50
 """
 
 import argparse
@@ -17,7 +30,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import numpy as np
 import pandas as pd
@@ -27,7 +40,9 @@ from tqdm import tqdm
 
 from src.models import MessagePassingGNN, TransEEncoder
 from src.utils import (
+    AttentionConfig,
     ExperimentConfig,
+    FewShotConfig,
     GraphFormatter,
     Neo4jClient,
     Neo4jConfig,
@@ -35,29 +50,44 @@ from src.utils import (
     get_logger,
     set_seed,
 )
+from src.utils.attention import AttentionExtractor
+from src.utils.evaluation import Evaluator
+from src.utils.few_shot import FewShotSelector
 from src.utils.llm_client import LLMClient, LLMResponse
+from src.utils.local_llm import LocalLLMManager, LocalLLMResponse, MODEL_REGISTRY
 
 logger = get_logger("experiment")
 
-VALID_EXPERIMENTS = {"llm", "text_rag", "graph_lpg", "graph_rdf"}
+# Legacy experiment name → context mapping
+LEGACY_EXPERIMENT_MAP = {
+    "llm": "none",
+    "text_rag": "none",  # text_rag uses references, handled specially
+    "graph_lpg": "lpg",
+    "graph_rdf": "rdf",
+}
+
+VALID_CONTEXTS = {"none", "lpg", "rdf", "lpg_rdf"}
 
 
 class LocalExperiment:
-    """Orchestrates 4-way comparison experiment using remote LLM API."""
+    """Orchestrates 3-axis comparison experiment with local HF models."""
 
     def __init__(self, config: ExperimentConfig):
         self.config = config
-        self.llm: Optional[LLMClient] = None
+        self.local_llm: Optional[LocalLLMManager] = None
+        self.llm_api: Optional[LLMClient] = None  # Legacy API fallback
         self.embedder = None
         self.neo4j_lpg: Optional[Neo4jClient] = None
         self.neo4j_rdf: Optional[Neo4jClient] = None
         self.gnn_lpg: Optional[MessagePassingGNN] = None
         self.kge_rdf: Optional[TransEEncoder] = None
         self.device = torch.device(config.model.device)
+        self.few_shot_selector: Optional[FewShotSelector] = None
+        self.evaluator: Optional[Evaluator] = None
 
         # Entity embedding cache
         self._entity_embeddings: Dict[str, torch.Tensor] = {}
-        # RDF index maps (persisted across samples)
+        # RDF index maps
         self._node_to_idx: Dict[str, int] = {}
         self._rel_to_idx: Dict[str, int] = {}
 
@@ -65,24 +95,35 @@ class LocalExperiment:
     # Setup / teardown
     # ------------------------------------------------------------------
 
-    def setup(self, experiments: set[str]) -> None:
-        """Initialize only the components needed for the requested experiments."""
+    def setup(self, contexts: Set[str], use_api: bool = False) -> None:
+        """
+        Initialize components needed for the requested contexts.
+
+        Args:
+            contexts: Set of context modes to prepare for
+            use_api: Use remote LLM API instead of local models
+        """
         mc = self.config.model
 
-        # LLM client (always needed)
-        logger.info(f"Connecting to LLM API: {mc.llm_api_base_url}")
-        self.llm = LLMClient(
-            base_url=mc.llm_api_base_url,
-            api_key=mc.llm_api_key,
-            model=mc.llm_api_model,
-        )
-        if self.llm.health_check():
-            logger.info(f"LLM API OK — model: {mc.llm_api_model}")
+        # LocalLLMManager (models loaded/unloaded per-alias in run_all)
+        if not use_api:
+            self.local_llm = LocalLLMManager(mc)
+            logger.info("LocalLLMManager initialized (models loaded per-alias)")
         else:
-            logger.warning("LLM API health check failed — proceeding anyway")
+            # Legacy API mode
+            logger.info(f"Connecting to LLM API: {mc.llm_api_base_url}")
+            self.llm_api = LLMClient(
+                base_url=mc.llm_api_base_url,
+                api_key=mc.llm_api_key,
+                model=mc.llm_api_model,
+            )
+            if self.llm_api.health_check():
+                logger.info(f"LLM API OK — model: {mc.llm_api_model}")
+            else:
+                logger.warning("LLM API health check failed — proceeding anyway")
 
-        # Embedder + GNN models (only for graph experiments)
-        needs_graph = experiments & {"graph_lpg", "graph_rdf"}
+        # Embedder + GNN models (for graph contexts)
+        needs_graph = contexts & {"lpg", "rdf", "lpg_rdf"}
         if needs_graph:
             from sentence_transformers import SentenceTransformer
 
@@ -90,11 +131,10 @@ class LocalExperiment:
             self.embedder = SentenceTransformer(mc.embedding_model_id)
             logger.info(f"Embedder loaded ({mc.embedding_dim}-dim)")
 
-        if "graph_lpg" in experiments:
+        needs_lpg = contexts & {"lpg", "lpg_rdf"}
+        if needs_lpg:
             logger.info("Connecting to Neo4j (finderlpg)...")
-            self.neo4j_lpg = Neo4jClient(
-                Neo4jConfig(database="finderlpg")
-            )
+            self.neo4j_lpg = Neo4jClient(Neo4jConfig(database="finderlpg"))
             self.neo4j_lpg.connect()
             info = self.neo4j_lpg.get_database_info()
             logger.info(f"finderlpg: {info['node_count']:,} nodes, {info['edge_count']:,} edges")
@@ -112,11 +152,10 @@ class LocalExperiment:
                 f"MessagePassingGNN: {sum(p.numel() for p in self.gnn_lpg.parameters()):,} params"
             )
 
-        if "graph_rdf" in experiments:
+        needs_rdf = contexts & {"rdf", "lpg_rdf"}
+        if needs_rdf:
             logger.info("Connecting to Neo4j (finderrdf)...")
-            self.neo4j_rdf = Neo4jClient(
-                Neo4jConfig(database="finderrdf")
-            )
+            self.neo4j_rdf = Neo4jClient(Neo4jConfig(database="finderrdf"))
             self.neo4j_rdf.connect()
             info = self.neo4j_rdf.get_database_info()
             logger.info(f"finderrdf: {info['node_count']:,} nodes, {info['edge_count']:,} edges")
@@ -134,8 +173,22 @@ class LocalExperiment:
                 f"TransEEncoder: {sum(p.numel() for p in self.kge_rdf.parameters()):,} params"
             )
 
+        # Few-shot selector
+        if self.config.few_shot.enabled:
+            self.few_shot_selector = FewShotSelector(self.config.few_shot)
+            if not self.few_shot_selector.load():
+                logger.info("Few-shot cache not found, will build during run_all")
+
+        # Evaluator
+        self.evaluator = Evaluator(
+            use_bertscore=self.config.eval_bertscore,
+            use_rouge=self.config.eval_rouge,
+        )
+
     def cleanup(self) -> None:
         """Release resources."""
+        if self.local_llm:
+            self.local_llm.unload_model()
         if self.neo4j_lpg:
             self.neo4j_lpg.close()
         if self.neo4j_rdf:
@@ -218,122 +271,8 @@ class LocalExperiment:
             logger.warning(f"RDF subgraph load failed for {question_id}: {e}")
         return {"nodes": [], "edges": []}
 
-    # ------------------------------------------------------------------
-    # Individual experiment methods
-    # ------------------------------------------------------------------
-
-    def run_llm_only(self, question: str) -> dict:
-        """[A] LLM Only — no context."""
-        resp = self.llm.generate(
-            question,
-            max_tokens=self.config.max_new_tokens,
-            temperature=self.config.temperature,
-        )
-        return {
-            "response_llm_only": resp.text,
-            "llm_only_time": resp.generation_time,
-            "llm_only_input_tokens": resp.input_tokens,
-            "llm_only_output_tokens": resp.output_tokens,
-        }
-
-    def run_text_rag(self, question: str, references) -> dict:
-        """[B] Text RAG — references as context."""
-        try:
-            parsed = ast.literal_eval(references) if isinstance(references, str) else references
-            context = "\n".join(parsed) if isinstance(parsed, list) else str(references)
-        except (ValueError, SyntaxError):
-            context = str(references) if references else ""
-
-        if not context:
-            resp = self.llm.generate(
-                question,
-                max_tokens=self.config.max_new_tokens,
-                temperature=self.config.temperature,
-            )
-        else:
-            resp = self.llm.generate(
-                question,
-                context=context,
-                max_tokens=self.config.max_new_tokens,
-                temperature=self.config.temperature,
-            )
-        return {
-            "response_text_rag": resp.text,
-            "text_rag_time": resp.generation_time,
-            "text_rag_input_tokens": resp.input_tokens,
-            "text_rag_output_tokens": resp.output_tokens,
-        }
-
-    def run_graph_lpg(self, question: str, question_id: str) -> dict:
-        """[C] Graph RAG (LPG) — GAT over subgraph, text context to LLM."""
-        subgraph = self.neo4j_lpg.get_subgraph(
-            question_id, max_hops=self.config.max_hops
-        )
-        pyg_data = self._build_lpg_graph(subgraph)
-
-        if pyg_data is None or pyg_data.x.shape[0] == 0:
-            resp = self.llm.generate(
-                question,
-                max_tokens=self.config.max_new_tokens,
-                temperature=self.config.temperature,
-            )
-            return {
-                "response_graph_lpg": resp.text,
-                "graph_lpg_time": resp.generation_time,
-                "graph_lpg_input_tokens": resp.input_tokens,
-                "graph_lpg_output_tokens": resp.output_tokens,
-                "lpg_nodes": 0,
-                "lpg_edges": 0,
-            }
-
-        pyg_data = pyg_data.to(self.device)
-        with torch.no_grad():
-            _ = self.gnn_lpg(pyg_data.x, pyg_data.edge_index)
-
-        # Format graph as text context (soft prompt)
-        context = GraphFormatter.format(
-            nodes=subgraph["nodes"],
-            edges=subgraph["edges"],
-            style=self.config.soft_prompt_format,
-            max_nodes=self.config.max_context_nodes,
-            max_edges=self.config.max_context_edges,
-        )
-
-        resp = self.llm.generate(
-            question,
-            context=context,
-            max_tokens=self.config.max_new_tokens,
-            temperature=self.config.temperature,
-        )
-        return {
-            "response_graph_lpg": resp.text,
-            "graph_lpg_time": resp.generation_time,
-            "graph_lpg_input_tokens": resp.input_tokens,
-            "graph_lpg_output_tokens": resp.output_tokens,
-            "lpg_nodes": int(pyg_data.x.shape[0]),
-            "lpg_edges": int(pyg_data.edge_index.shape[1]),
-        }
-
-    def run_graph_rdf(self, question: str, question_id: str) -> dict:
-        """[D] Graph RAG (RDF) — TransE over triples, text context to LLM."""
-        subgraph = self._load_subgraph_rdf(question_id)
-        edges = subgraph.get("edges", [])
-
-        if not edges:
-            resp = self.llm.generate(
-                question,
-                max_tokens=self.config.max_new_tokens,
-                temperature=self.config.temperature,
-            )
-            return {
-                "response_graph_rdf": resp.text,
-                "graph_rdf_time": resp.generation_time,
-                "graph_rdf_input_tokens": resp.input_tokens,
-                "graph_rdf_output_tokens": resp.output_tokens,
-                "rdf_nodes": 0,
-                "rdf_edges": 0,
-            }
-
+    def _process_rdf_triples(self, edges: list) -> tuple:
+        """Process RDF edges into TransE inputs and descriptions."""
         head_indices, rel_types, tail_indices, edge_descs = [], [], [], []
         for e in edges:
             src = e.get("source")
@@ -350,65 +289,231 @@ class LocalExperiment:
                 rel_types.append(self._rel_to_idx[rel])
                 tail_indices.append(self._node_to_idx[tgt])
                 edge_descs.append(f"{src} --{rel}--> {tgt}")
+        return head_indices, rel_types, tail_indices, edge_descs
 
-        if not head_indices:
-            resp = self.llm.generate(
-                question,
+    # ------------------------------------------------------------------
+    # Context building
+    # ------------------------------------------------------------------
+
+    def _build_context(
+        self, context_mode: str, question_id: str, references: str = ""
+    ) -> tuple:
+        """
+        Build context string for a given mode.
+
+        Returns:
+            (context_str, subgraph_info_dict, entity_names)
+        """
+        info = {
+            "lpg_nodes": 0, "lpg_edges": 0,
+            "rdf_nodes": 0, "rdf_edges": 0,
+        }
+        entity_names = []
+
+        if context_mode == "none":
+            return None, info, entity_names
+
+        lpg_context = None
+        lpg_subgraph = None
+        rdf_context = None
+        rdf_subgraph = None
+
+        # LPG processing
+        if context_mode in ("lpg", "lpg_rdf") and self.neo4j_lpg:
+            lpg_subgraph = self.neo4j_lpg.get_subgraph(
+                question_id, max_hops=self.config.max_hops
+            )
+            pyg_data = self._build_lpg_graph(lpg_subgraph)
+            if pyg_data is not None and pyg_data.x.shape[0] > 0:
+                pyg_data = pyg_data.to(self.device)
+                with torch.no_grad():
+                    _ = self.gnn_lpg(pyg_data.x, pyg_data.edge_index)
+                info["lpg_nodes"] = int(pyg_data.x.shape[0])
+                info["lpg_edges"] = int(pyg_data.edge_index.shape[1])
+                entity_names.extend(
+                    n.get("name", n.get("id", ""))
+                    for n in lpg_subgraph.get("nodes", [])
+                )
+
+        # RDF processing
+        if context_mode in ("rdf", "lpg_rdf") and self.neo4j_rdf:
+            rdf_subgraph = self._load_subgraph_rdf(question_id)
+            edges = rdf_subgraph.get("edges", [])
+            if edges:
+                head_idx, rel_types, tail_idx, edge_descs = self._process_rdf_triples(edges)
+                if head_idx:
+                    with torch.no_grad():
+                        _ = self.kge_rdf(
+                            torch.tensor(head_idx, device=self.device),
+                            torch.tensor(rel_types, device=self.device),
+                            torch.tensor(tail_idx, device=self.device),
+                        )
+                    info["rdf_nodes"] = len(set(head_idx + tail_idx))
+                    info["rdf_edges"] = len(head_idx)
+
+        # Format context
+        if context_mode == "lpg":
+            if lpg_subgraph and info["lpg_nodes"] > 0:
+                lpg_context = GraphFormatter.format(
+                    nodes=lpg_subgraph["nodes"],
+                    edges=lpg_subgraph["edges"],
+                    style=self.config.soft_prompt_format,
+                    max_nodes=self.config.max_context_nodes,
+                    max_edges=self.config.max_context_edges,
+                )
+            return lpg_context, info, entity_names
+
+        elif context_mode == "rdf":
+            if rdf_subgraph and info["rdf_edges"] > 0:
+                rdf_edges = rdf_subgraph.get("edges", [])
+                rdf_context = "=== [RDF/TransE] Triples ===\n" + "\n".join(
+                    f"- {e.get('source', '?')} --{e.get('type', 'rel')}--> {e.get('target', '?')}"
+                    for e in rdf_edges[:40]
+                )
+            return rdf_context, info, entity_names
+
+        elif context_mode == "lpg_rdf":
+            if (lpg_subgraph and info["lpg_nodes"] > 0) or (rdf_subgraph and info["rdf_edges"] > 0):
+                combined = GraphFormatter.format_combined(
+                    lpg_nodes=lpg_subgraph.get("nodes", []) if lpg_subgraph else [],
+                    lpg_edges=lpg_subgraph.get("edges", []) if lpg_subgraph else [],
+                    rdf_edges=rdf_subgraph.get("edges", []) if rdf_subgraph else [],
+                    style=self.config.soft_prompt_format,
+                )
+                return combined, info, entity_names
+            return None, info, entity_names
+
+        return None, info, entity_names
+
+    # ------------------------------------------------------------------
+    # Unified condition runner
+    # ------------------------------------------------------------------
+
+    def run_condition(
+        self,
+        question: str,
+        question_id: str,
+        category: str,
+        references: str,
+        context_mode: str,
+        few_shot: bool,
+        model_alias: str,
+    ) -> dict:
+        """
+        Run a single experimental condition.
+
+        Args:
+            question: Question text
+            question_id: Question identifier
+            category: Question category
+            references: Text references (for text_rag fallback)
+            context_mode: "none" | "lpg" | "rdf" | "lpg_rdf"
+            few_shot: Whether to include few-shot examples
+            model_alias: Current model alias
+
+        Returns:
+            Dict with response, timing, subgraph info
+        """
+        # Build context
+        context, subgraph_info, entity_names = self._build_context(
+            context_mode, question_id, references
+        )
+
+        # Build few-shot examples
+        few_shot_examples = None
+        if few_shot and self.few_shot_selector:
+            examples = self.few_shot_selector.get_examples(
+                category, exclude_question_id=question_id
+            )
+            if examples:
+                few_shot_examples = self.few_shot_selector.format_for_prompt(examples)
+
+        # Generate
+        extract_attention = (
+            self.config.attention.enabled
+            and context is not None
+            and self.local_llm is not None
+        )
+
+        result = {
+            "model": model_alias,
+            "context_mode": context_mode,
+            "few_shot": few_shot,
+            **subgraph_info,
+        }
+
+        if self.local_llm and self.local_llm.model is not None:
+            resp = self.local_llm.generate(
+                question=question,
+                context=context,
+                few_shot_examples=few_shot_examples,
+                max_new_tokens=self.config.max_new_tokens,
+                temperature=self.config.temperature,
+                extract_attention=extract_attention,
+                attention_config=self.config.attention if extract_attention else None,
+                entity_names=entity_names if extract_attention else None,
+            )
+            result["response"] = resp.text
+            result["generation_time"] = resp.generation_time
+            result["input_tokens"] = resp.input_tokens
+            result["output_tokens"] = resp.output_tokens
+
+            # Save attention data
+            if resp.attention_data and self.config.attention.enabled:
+                self._save_attention_result(
+                    resp.attention_data, model_alias, context_mode,
+                    few_shot, question_id,
+                )
+
+        elif self.llm_api:
+            # Legacy API path
+            resp = self.llm_api.generate(
+                question=question,
+                context=context,
                 max_tokens=self.config.max_new_tokens,
                 temperature=self.config.temperature,
             )
-            return {
-                "response_graph_rdf": resp.text,
-                "graph_rdf_time": resp.generation_time,
-                "graph_rdf_input_tokens": resp.input_tokens,
-                "graph_rdf_output_tokens": resp.output_tokens,
-                "rdf_nodes": 0,
-                "rdf_edges": 0,
-            }
+            result["response"] = resp.text
+            result["generation_time"] = resp.generation_time
+            result["input_tokens"] = resp.input_tokens
+            result["output_tokens"] = resp.output_tokens
 
-        with torch.no_grad():
-            _ = self.kge_rdf(
-                torch.tensor(head_indices, device=self.device),
-                torch.tensor(rel_types, device=self.device),
-                torch.tensor(tail_indices, device=self.device),
-            )
+        return result
 
-        # Format triples as text context (soft prompt)
-        context = "=== [RDF/TransE] Triples ===\n" + "\n".join(
-            f"- {d}" for d in edge_descs[:40]
-        )
-
-        resp = self.llm.generate(
-            question,
-            context=context,
-            max_tokens=self.config.max_new_tokens,
-            temperature=self.config.temperature,
-        )
-        return {
-            "response_graph_rdf": resp.text,
-            "graph_rdf_time": resp.generation_time,
-            "graph_rdf_input_tokens": resp.input_tokens,
-            "graph_rdf_output_tokens": resp.output_tokens,
-            "rdf_nodes": len(set(head_indices + tail_indices)),
-            "rdf_edges": len(head_indices),
-        }
+    def _save_attention_result(
+        self, attention_data, model_alias: str, context_mode: str,
+        few_shot: bool, question_id: str,
+    ) -> None:
+        """Save attention result to disk."""
+        timestamp = getattr(self, "_run_timestamp", "unknown")
+        fs_label = "fewshot" if few_shot else "zeroshot"
+        attn_dir = Path(self.config.attention.output_dir) / timestamp / model_alias
+        attn_dir = attn_dir / f"{context_mode}_{fs_label}"
+        save_path = attn_dir / f"{question_id}.npz"
+        try:
+            AttentionExtractor.save_attention(attention_data, str(save_path))
+        except Exception as e:
+            logger.warning(f"Failed to save attention for {question_id}: {e}")
 
     # ------------------------------------------------------------------
-    # Main runner
+    # Main runner: 3-axis matrix
     # ------------------------------------------------------------------
 
     def run_all(
         self,
         df: pd.DataFrame,
-        experiments: set[str],
         sample_size: Optional[int] = None,
     ) -> pd.DataFrame:
-        """Run selected experiments on the dataset.
+        """
+        Run the full 3-axis experiment matrix.
+
+        Outer loop: models (load/unload)
+        Middle loop: samples
+        Inner loops: contexts × few-shot
 
         Args:
-            df: DataFrame with columns _id, text, answer, references, category, ...
-            experiments: Set of experiment names to run
-            sample_size: Limit number of samples (None = all)
+            df: DataFrame with _id, text, answer, references, category
+            sample_size: Limit samples (None = all)
 
         Returns:
             Results DataFrame
@@ -416,14 +521,152 @@ class LocalExperiment:
         if sample_size:
             df = df.head(sample_size)
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_dir = Path(self.config.results_dir) / "experiments"
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build few-shot examples if needed and not cached
+        if self.config.few_shot.enabled and self.few_shot_selector and not self.few_shot_selector._loaded:
+            logger.info("Building few-shot examples from dataset...")
+            self.few_shot_selector.build_examples(df, self.embedder)
+            self.few_shot_selector.save()
+
+        # Determine few-shot conditions
+        few_shot_conditions = [False]
+        if self.config.few_shot.enabled:
+            few_shot_conditions.append(True)
+
+        results: List[dict] = []
+        total_conditions = (
+            len(self.config.model_aliases)
+            * len(df)
+            * len(self.config.context_conditions)
+            * len(few_shot_conditions)
+        )
+        logger.info(
+            f"Experiment matrix: {len(self.config.model_aliases)} models × "
+            f"{len(df)} samples × {len(self.config.context_conditions)} contexts × "
+            f"{len(few_shot_conditions)} few-shot = {total_conditions} conditions"
+        )
+
+        for model_alias in self.config.model_aliases:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"MODEL: {model_alias}")
+            logger.info(f"{'='*60}")
+
+            # Load model
+            if self.local_llm:
+                self.local_llm.load_model(
+                    model_alias,
+                    attention_config=self.config.attention if self.config.attention.enabled else None,
+                )
+
+            model_results: List[dict] = []
+
+            for i, (_, row) in enumerate(tqdm(
+                df.iterrows(), total=len(df),
+                desc=f"{model_alias}"
+            )):
+                question_id = row["_id"]
+                question = row["text"]
+                ground_truth = row["answer"]
+                references = row.get("references", "")
+                category = row.get("category", "")
+
+                for context_mode in self.config.context_conditions:
+                    for few_shot in few_shot_conditions:
+                        try:
+                            result = self.run_condition(
+                                question=question,
+                                question_id=question_id,
+                                category=category,
+                                references=references,
+                                context_mode=context_mode,
+                                few_shot=few_shot,
+                                model_alias=model_alias,
+                            )
+                            result["question_id"] = question_id
+                            result["question"] = question
+                            result["ground_truth"] = str(ground_truth)
+                            result["category"] = category
+                            result["error"] = ""
+                        except Exception as e:
+                            logger.error(
+                                f"Error: {model_alias}/{context_mode}/"
+                                f"{'fs' if few_shot else 'zs'} sample {i} ({question_id}): {e}"
+                            )
+                            result = {
+                                "question_id": question_id,
+                                "question": question,
+                                "ground_truth": str(ground_truth),
+                                "category": category,
+                                "model": model_alias,
+                                "context_mode": context_mode,
+                                "few_shot": few_shot,
+                                "response": "",
+                                "generation_time": 0.0,
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "lpg_nodes": 0,
+                                "lpg_edges": 0,
+                                "rdf_nodes": 0,
+                                "rdf_edges": 0,
+                                "error": str(e),
+                            }
+
+                        model_results.append(result)
+
+                # Checkpoint per model
+                if (i + 1) % self.config.checkpoint_interval == 0:
+                    ckpt_path = results_dir / f"{self._run_timestamp}_checkpoint_{model_alias}_{i+1}.csv"
+                    pd.DataFrame(model_results).to_csv(ckpt_path, index=False)
+                    logger.info(f"Checkpoint: {ckpt_path} ({i+1}/{len(df)})")
+
+                # Memory cleanup between samples
+                torch.cuda.empty_cache()
+
+            results.extend(model_results)
+
+            # Unload model before loading next
+            if self.local_llm:
+                self.local_llm.unload_model()
+
+        # Final results
+        results_df = pd.DataFrame(results)
+        final_path = results_dir / f"{self._run_timestamp}_results_final.csv"
+        results_df.to_csv(final_path, index=False)
+        logger.info(f"Final results saved: {final_path}")
+
+        # Evaluate and summarize
+        self._evaluate_and_summarize(results_df, results_dir)
+
+        return results_df
+
+    # ------------------------------------------------------------------
+    # Legacy compatibility: run with old-style experiments
+    # ------------------------------------------------------------------
+
+    def run_legacy(
+        self,
+        df: pd.DataFrame,
+        experiments: Set[str],
+        sample_size: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """
+        Legacy runner: 4-experiment style (API-based).
+        Maps old experiment names to context modes and runs via run_condition.
+        """
+        if sample_size:
+            df = df.head(sample_size)
+
+        self._run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         results_dir = Path(self.config.results_dir) / "experiments"
         results_dir.mkdir(parents=True, exist_ok=True)
 
         results: List[dict] = []
         total = len(df)
 
-        logger.info(f"Running experiments {experiments} on {total} samples")
+        logger.info(f"Running legacy experiments {experiments} on {total} samples")
 
         for i, (_, row) in enumerate(tqdm(df.iterrows(), total=total, desc="Experiments")):
             question_id = row["_id"]
@@ -432,7 +675,7 @@ class LocalExperiment:
             references = row.get("references", "")
             category = row.get("category", "")
 
-            result = {
+            base_result = {
                 "question_id": question_id,
                 "question": question,
                 "ground_truth": ground_truth,
@@ -441,43 +684,184 @@ class LocalExperiment:
 
             try:
                 if "llm" in experiments:
-                    result.update(self.run_llm_only(question))
+                    r = self.run_condition(
+                        question, question_id, category, references,
+                        context_mode="none", few_shot=False,
+                        model_alias=self.config.model_aliases[0],
+                    )
+                    base_result.update({
+                        "response_llm_only": r.get("response", ""),
+                        "llm_only_time": r.get("generation_time", 0),
+                        "llm_only_input_tokens": r.get("input_tokens", 0),
+                        "llm_only_output_tokens": r.get("output_tokens", 0),
+                    })
 
                 if "text_rag" in experiments:
-                    result.update(self.run_text_rag(question, references))
+                    # Text RAG: parse references as context
+                    try:
+                        parsed = ast.literal_eval(references) if isinstance(references, str) else references
+                        context = "\n".join(parsed) if isinstance(parsed, list) else str(references)
+                    except (ValueError, SyntaxError):
+                        context = str(references) if references else ""
+
+                    if self.llm_api:
+                        resp = self.llm_api.generate(
+                            question, context=context if context else None,
+                            max_tokens=self.config.max_new_tokens,
+                            temperature=self.config.temperature,
+                        )
+                        base_result.update({
+                            "response_text_rag": resp.text,
+                            "text_rag_time": resp.generation_time,
+                            "text_rag_input_tokens": resp.input_tokens,
+                            "text_rag_output_tokens": resp.output_tokens,
+                        })
 
                 if "graph_lpg" in experiments:
-                    result.update(self.run_graph_lpg(question, question_id))
+                    r = self.run_condition(
+                        question, question_id, category, references,
+                        context_mode="lpg", few_shot=False,
+                        model_alias=self.config.model_aliases[0],
+                    )
+                    base_result.update({
+                        "response_graph_lpg": r.get("response", ""),
+                        "graph_lpg_time": r.get("generation_time", 0),
+                        "graph_lpg_input_tokens": r.get("input_tokens", 0),
+                        "graph_lpg_output_tokens": r.get("output_tokens", 0),
+                        "lpg_nodes": r.get("lpg_nodes", 0),
+                        "lpg_edges": r.get("lpg_edges", 0),
+                    })
 
                 if "graph_rdf" in experiments:
-                    result.update(self.run_graph_rdf(question, question_id))
+                    r = self.run_condition(
+                        question, question_id, category, references,
+                        context_mode="rdf", few_shot=False,
+                        model_alias=self.config.model_aliases[0],
+                    )
+                    base_result.update({
+                        "response_graph_rdf": r.get("response", ""),
+                        "graph_rdf_time": r.get("generation_time", 0),
+                        "graph_rdf_input_tokens": r.get("input_tokens", 0),
+                        "graph_rdf_output_tokens": r.get("output_tokens", 0),
+                        "rdf_nodes": r.get("rdf_nodes", 0),
+                        "rdf_edges": r.get("rdf_edges", 0),
+                    })
 
             except Exception as e:
                 logger.error(f"Error at sample {i} ({question_id}): {e}")
-                # Keep partial results
-                result["error"] = str(e)
+                base_result["error"] = str(e)
 
-            results.append(result)
+            results.append(base_result)
 
-            # Checkpoint
             if (i + 1) % self.config.checkpoint_interval == 0:
-                ckpt_path = results_dir / f"{timestamp}_checkpoint_{i + 1}.csv"
+                ckpt_path = results_dir / f"{self._run_timestamp}_checkpoint_{i+1}.csv"
                 pd.DataFrame(results).to_csv(ckpt_path, index=False)
-                logger.info(f"Checkpoint saved: {ckpt_path} ({i + 1}/{total})")
+                logger.info(f"Checkpoint: {ckpt_path} ({i+1}/{total})")
 
-        # Final save
         results_df = pd.DataFrame(results)
-        final_path = results_dir / f"{timestamp}_results_final.csv"
+        final_path = results_dir / f"{self._run_timestamp}_results_final.csv"
         results_df.to_csv(final_path, index=False)
         logger.info(f"Final results saved: {final_path}")
 
-        # Print summary
-        self._print_summary(results_df, experiments)
-
+        self._print_legacy_summary(results_df, experiments)
         return results_df
 
-    def _print_summary(self, df: pd.DataFrame, experiments: set[str]) -> None:
-        """Print experiment summary statistics."""
+    # ------------------------------------------------------------------
+    # Evaluation and summary
+    # ------------------------------------------------------------------
+
+    def _evaluate_and_summarize(
+        self, df: pd.DataFrame, results_dir: Path
+    ) -> None:
+        """Evaluate all conditions and print/save summary."""
+        if self.evaluator is None or "response" not in df.columns:
+            return
+
+        print("\n" + "=" * 80)
+        print("3-AXIS EXPERIMENT RESULTS")
+        print("=" * 80)
+        print(f"Total conditions: {len(df)}")
+        print(f"Models: {df['model'].unique().tolist()}")
+        print(f"Contexts: {df['context_mode'].unique().tolist()}")
+        print(f"Few-shot: {df['few_shot'].unique().tolist()}")
+
+        # Group by (model, context_mode, few_shot)
+        summary_rows = []
+        groups = df.groupby(["model", "context_mode", "few_shot"])
+
+        for (model, ctx, fs), group in groups:
+            valid = group.dropna(subset=["response", "ground_truth"])
+            valid = valid[valid["response"] != ""]
+
+            if len(valid) == 0:
+                continue
+
+            predictions = valid["response"].tolist()
+            references = valid["ground_truth"].tolist()
+
+            metrics = self.evaluator.evaluate_batch(predictions, references)
+
+            row = {
+                "model": model,
+                "context_mode": ctx,
+                "few_shot": fs,
+                "n_samples": len(valid),
+                "avg_gen_time": valid["generation_time"].mean(),
+                "avg_input_tokens": valid["input_tokens"].mean(),
+                "avg_output_tokens": valid["output_tokens"].mean(),
+                **metrics,
+            }
+
+            if "lpg_nodes" in valid.columns:
+                row["avg_lpg_nodes"] = valid["lpg_nodes"].mean()
+                row["avg_lpg_edges"] = valid["lpg_edges"].mean()
+            if "rdf_nodes" in valid.columns:
+                row["avg_rdf_nodes"] = valid["rdf_nodes"].mean()
+                row["avg_rdf_edges"] = valid["rdf_edges"].mean()
+
+            summary_rows.append(row)
+
+            fs_label = "few-shot" if fs else "zero-shot"
+            print(f"\n--- {model} | {ctx} | {fs_label} (n={len(valid)}) ---")
+            print(f"  EM: {metrics.get('exact_match', 0):.1%}")
+            print(f"  Substring: {metrics.get('substring_match', 0):.1%}")
+            print(f"  Token F1: {metrics.get('token_f1', 0):.3f}")
+            if "rouge_l" in metrics:
+                print(f"  ROUGE-L: {metrics.get('rouge_l', 0):.3f}")
+            if "bert_score_f1" in metrics:
+                print(f"  BERTScore: {metrics.get('bert_score_f1', 0):.3f}")
+            print(f"  Avg time: {valid['generation_time'].mean():.2f}s")
+
+        # Save summary
+        if summary_rows:
+            summary_df = pd.DataFrame(summary_rows)
+            summary_path = results_dir / f"{self._run_timestamp}_summary.csv"
+            summary_df.to_csv(summary_path, index=False)
+            logger.info(f"Summary saved: {summary_path}")
+
+            print(f"\n{'='*80}")
+            print(f"Summary saved: {summary_path}")
+
+        # Save metadata
+        meta = {
+            "timestamp": self._run_timestamp,
+            "config": self.config.to_dict(),
+            "total_samples": len(df),
+            "models": self.config.model_aliases,
+            "contexts": self.config.context_conditions,
+            "few_shot_enabled": self.config.few_shot.enabled,
+            "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+            "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        }
+        meta_path = results_dir / f"{self._run_timestamp}_metadata.json"
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2, default=str)
+        logger.info(f"Metadata saved: {meta_path}")
+
+        print("=" * 80)
+
+    def _print_legacy_summary(self, df: pd.DataFrame, experiments: Set[str]) -> None:
+        """Print legacy-format experiment summary."""
         print("\n" + "=" * 70)
         print("EXPERIMENT SUMMARY")
         print("=" * 70)
@@ -520,17 +904,6 @@ class LocalExperiment:
                 avg_out = df[out_col].dropna().mean()
                 print(f"  {exp}: in={avg_in:.0f}, out={avg_out:.0f}")
 
-        if "graph_lpg" in experiments and "lpg_nodes" in df.columns:
-            print(f"\n--- Graph Stats (LPG) ---")
-            print(f"  Avg nodes: {df['lpg_nodes'].dropna().mean():.1f}")
-            print(f"  Avg edges: {df['lpg_edges'].dropna().mean():.1f}")
-
-        if "graph_rdf" in experiments and "rdf_nodes" in df.columns:
-            print(f"\n--- Graph Stats (RDF) ---")
-            print(f"  Avg nodes: {df['rdf_nodes'].dropna().mean():.1f}")
-            print(f"  Avg edges: {df['rdf_edges'].dropna().mean():.1f}")
-
-        # Exact match / substring match
         if "ground_truth" in df.columns:
             print("\n--- Accuracy (simple) ---")
             for exp, col in [
@@ -568,15 +941,57 @@ def load_dataset(config: ExperimentConfig) -> pd.DataFrame:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run GNN+LLM comparison experiments")
+    parser = argparse.ArgumentParser(
+        description="Run 3-axis GNN+LLM comparison experiments"
+    )
+
+    # New 3-axis arguments
+    parser.add_argument(
+        "--models", nargs="+", default=None,
+        choices=sorted(MODEL_REGISTRY.keys()),
+        help="Model aliases to evaluate (default: llama8b)",
+    )
+    parser.add_argument(
+        "--contexts", nargs="+", default=None,
+        choices=sorted(VALID_CONTEXTS),
+        help="Context conditions (default: none lpg rdf lpg_rdf)",
+    )
+    parser.add_argument(
+        "--few-shot", action="store_true", default=False,
+        help="Enable few-shot examples",
+    )
+    parser.add_argument(
+        "--few-shot-n", type=int, default=1,
+        help="Number of few-shot examples per category",
+    )
+    parser.add_argument(
+        "--extract-attention", action="store_true", default=False,
+        help="Extract attention scores",
+    )
+    parser.add_argument(
+        "--attention-layers", nargs="+", type=int, default=None,
+        help="Layer indices for attention extraction (e.g. -1 -2 -3)",
+    )
+    parser.add_argument(
+        "--no-bertscore", action="store_true", default=False,
+        help="Disable BERTScore evaluation",
+    )
+    parser.add_argument(
+        "--no-rouge", action="store_true", default=False,
+        help="Disable ROUGE evaluation",
+    )
+
+    # Legacy arguments
+    parser.add_argument(
+        "--experiments", nargs="+", default=None,
+        choices=sorted({"llm", "text_rag", "graph_lpg", "graph_rdf"}),
+        help="(Legacy) Which experiments to run",
+    )
+
+    # Common arguments
     parser.add_argument(
         "--sample-size", type=int, default=None,
         help="Number of samples to evaluate (default: all)",
-    )
-    parser.add_argument(
-        "--experiments", nargs="+", default=["llm", "text_rag", "graph_lpg", "graph_rdf"],
-        choices=sorted(VALID_EXPERIMENTS),
-        help="Which experiments to run",
     )
     parser.add_argument(
         "--format-style", default="structured",
@@ -591,6 +1006,9 @@ def main():
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     args = parser.parse_args()
 
+    # Determine run mode
+    legacy_mode = args.experiments is not None and args.models is None
+
     # Setup logging
     setup_logging(level=args.log_level)
 
@@ -599,8 +1017,32 @@ def main():
     config.soft_prompt_format = args.format_style
     config.seed = args.seed
     config.sample_size = args.sample_size
+    config.eval_bertscore = not args.no_bertscore
+    config.eval_rouge = not args.no_rouge
+
     if args.parquet_path:
         config.parquet_path = args.parquet_path
+
+    # 3-axis config
+    if args.models:
+        config.model_aliases = args.models
+    elif not legacy_mode:
+        config.model_aliases = ["llama8b"]
+
+    if args.contexts:
+        config.context_conditions = args.contexts
+    elif not legacy_mode:
+        config.context_conditions = ["none", "lpg", "rdf", "lpg_rdf"]
+
+    # Few-shot config
+    config.few_shot.enabled = args.few_shot
+    config.few_shot.num_examples_per_category = args.few_shot_n
+
+    # Attention config
+    config.attention.enabled = args.extract_attention
+    if args.attention_layers:
+        config.attention.layers_to_extract = args.attention_layers
+
     config.validate()
 
     # Reproducibility
@@ -610,11 +1052,23 @@ def main():
     df = load_dataset(config)
 
     # Run
-    experiments = set(args.experiments)
     exp = LocalExperiment(config)
     try:
-        exp.setup(experiments)
-        exp.run_all(df, experiments, sample_size=args.sample_size)
+        if legacy_mode:
+            # Legacy API mode
+            experiments = set(args.experiments)
+            contexts_needed = set()
+            for e in experiments:
+                ctx = LEGACY_EXPERIMENT_MAP.get(e, "none")
+                if ctx != "none":
+                    contexts_needed.add(ctx)
+            exp.setup(contexts_needed, use_api=True)
+            exp.run_legacy(df, experiments, sample_size=args.sample_size)
+        else:
+            # New 3-axis mode
+            contexts = set(config.context_conditions)
+            exp.setup(contexts, use_api=False)
+            exp.run_all(df, sample_size=args.sample_size)
     finally:
         exp.cleanup()
 

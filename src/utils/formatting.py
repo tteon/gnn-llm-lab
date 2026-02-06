@@ -76,6 +76,72 @@ class GraphFormatter:
         )
 
     @classmethod
+    def format_combined(
+        cls,
+        lpg_nodes: List[Dict[str, Any]],
+        lpg_edges: List[Dict[str, Any]],
+        rdf_edges: List[Dict[str, Any]],
+        style: Literal["structured", "natural", "triple", "csv"] = "structured",
+        max_total_tokens: int = 1500,
+        include_props: bool = True,
+        include_edge_types: bool = True,
+    ) -> str:
+        """
+        Format combined LPG + RDF context with budget allocation.
+
+        LPG gets 60% of the budget, RDF gets 40%.
+
+        Args:
+            lpg_nodes: LPG node dicts
+            lpg_edges: LPG edge dicts
+            rdf_edges: RDF edge dicts (as triple dicts with source/type/target)
+            style: Formatting style
+            max_total_tokens: Approximate max total tokens
+            include_props: Include node properties
+            include_edge_types: Include relationship types
+
+        Returns:
+            Combined formatted text
+        """
+        # Budget allocation: 60% LPG, 40% RDF
+        lpg_node_budget = int(max_total_tokens * 0.6 * 0.4)  # ~36% for LPG nodes
+        lpg_edge_budget = int(max_total_tokens * 0.6 * 0.6)  # ~24% for LPG edges
+        rdf_edge_budget = int(max_total_tokens * 0.4)
+
+        # Estimate ~10 tokens per node/edge line
+        max_lpg_nodes = max(lpg_node_budget // 10, 5)
+        max_lpg_edges = max(lpg_edge_budget // 10, 5)
+        max_rdf_edges = max(rdf_edge_budget // 10, 5)
+
+        parts = []
+
+        # LPG section
+        if lpg_nodes or lpg_edges:
+            lpg_text = cls.format(
+                nodes=lpg_nodes,
+                edges=lpg_edges,
+                style=style,
+                max_nodes=max_lpg_nodes,
+                max_edges=max_lpg_edges,
+                include_props=include_props,
+                include_edge_types=include_edge_types,
+            )
+            parts.append("=== LPG Knowledge Graph ===")
+            parts.append(lpg_text)
+
+        # RDF section
+        if rdf_edges:
+            rdf_lines = ["=== RDF Triples ==="]
+            for e in rdf_edges[:max_rdf_edges]:
+                src = e.get("source", "?")
+                tgt = e.get("target", "?")
+                rel = e.get("type", "related")
+                rdf_lines.append(f"({src}, {rel}, {tgt})")
+            parts.append("\n".join(rdf_lines))
+
+        return "\n\n".join(parts)
+
+    @classmethod
     def _format_structured(
         cls,
         nodes: List[Dict],

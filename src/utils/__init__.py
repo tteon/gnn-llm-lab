@@ -12,7 +12,10 @@ Provides:
 """
 
 from .logging_config import setup_logging, get_logger
-from .config import BaseConfig, Neo4jConfig, ModelConfig, ExperimentConfig, load_config
+from .config import (
+    BaseConfig, Neo4jConfig, ModelConfig, ExperimentConfig,
+    AttentionConfig, FewShotConfig, TrainingConfig, load_config,
+)
 from .exceptions import (
     GNNLLMError,
     ConfigurationError,
@@ -30,6 +33,10 @@ from .reproducibility import (
     ExperimentTracker,
 )
 from .llm_client import LLMClient, LLMResponse
+from .attention import AttentionExtractor, AttentionResult
+from .local_llm import LocalLLMManager, LocalLLMResponse, MODEL_REGISTRY
+from .few_shot import FewShotSelector
+from .evaluation import Evaluator, EvaluationResult
 
 __all__ = [
     # Logging
@@ -62,4 +69,20 @@ __all__ = [
     # LLM Client
     "LLMClient",
     "LLMResponse",
+    # Config (extended)
+    "AttentionConfig",
+    "FewShotConfig",
+    "TrainingConfig",
+    # Attention
+    "AttentionExtractor",
+    "AttentionResult",
+    # Local LLM
+    "LocalLLMManager",
+    "LocalLLMResponse",
+    "MODEL_REGISTRY",
+    # Few-shot
+    "FewShotSelector",
+    # Evaluation
+    "Evaluator",
+    "EvaluationResult",
 ]

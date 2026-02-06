@@ -387,10 +387,11 @@ class Neo4jClient:
         WITH collect(e) as seeds
         UNWIND seeds as seed
         OPTIONAL MATCH path = (seed)-[*1..%d]-(connected:Entity)
-        WITH seeds, collect(DISTINCT connected) as connected_nodes
-        WITH [n IN seeds + connected_nodes WHERE n IS NOT NULL] as all_nodes
+        WITH seeds + collect(DISTINCT connected) as all_raw
+        WITH [n IN all_raw WHERE n IS NOT NULL] as all_nodes
         UNWIND all_nodes as n
-        WITH DISTINCT n
+        WITH collect(DISTINCT n) as all_nodes
+        UNWIND all_nodes as n
         OPTIONAL MATCH (n)-[r]->(m:Entity)
         WHERE m IN all_nodes
         RETURN collect(DISTINCT {

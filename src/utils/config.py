@@ -194,15 +194,15 @@ class AttentionConfig:
     """Configuration for attention score extraction."""
     enabled: bool = True
     layers_to_extract: List[int] = field(default_factory=lambda: [-1, -2, -3])
-    aggregate_heads: str = "mean"  # "mean" | "max"
+    aggregate_heads: str = "mean"  # "mean" | "max" | "none" (per-head)
     save_context_attention_only: bool = True
     top_k_tokens: int = 50
     output_dir: str = "results/attention"
 
     def validate(self) -> "AttentionConfig":
-        if self.aggregate_heads not in ("mean", "max"):
+        if self.aggregate_heads not in ("mean", "max", "none"):
             raise ConfigurationError(
-                "aggregate_heads must be 'mean' or 'max'",
+                "aggregate_heads must be 'mean', 'max', or 'none'",
                 field="aggregate_heads",
                 value=self.aggregate_heads,
             )
@@ -400,7 +400,7 @@ class ExperimentConfig:
             raise ConfigurationError("checkpoint_interval must be positive", field="checkpoint_interval")
 
         # Validate context conditions
-        valid_contexts = {"none", "lpg", "rdf", "lpg_rdf"}
+        valid_contexts = {"none", "lpg", "rdf", "lpg_rdf", "text"}
         for ctx in self.context_conditions:
             if ctx not in valid_contexts:
                 raise ConfigurationError(

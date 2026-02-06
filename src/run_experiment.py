@@ -66,7 +66,7 @@ LEGACY_EXPERIMENT_MAP = {
     "graph_rdf": "rdf",
 }
 
-VALID_CONTEXTS = {"none", "lpg", "rdf", "lpg_rdf"}
+VALID_CONTEXTS = {"none", "lpg", "rdf", "lpg_rdf", "text"}
 
 
 class LocalExperiment:
@@ -244,11 +244,11 @@ class LocalExperiment:
     def _load_subgraph_rdf(self, question_id: str) -> dict:
         """Load RDF subgraph from finderrdf database."""
         query = """
-        MATCH (r:Resource)-[rel]-(r2:Resource)
-        WITH r, r2, rel LIMIT 100
+        MATCH (r:Resource)-[rel:TRIPLE]->(r2:Resource)
+        WHERE rel.question_id = $qid
         RETURN collect(DISTINCT {id: r.uri, uri: r.uri})
              + collect(DISTINCT {id: r2.uri, uri: r2.uri}) as nodes,
-               collect(DISTINCT {source: r.uri, target: r2.uri, type: type(rel)}) as edges
+               collect(DISTINCT {source: r.uri, target: r2.uri, type: rel.predicate}) as edges
         """
         try:
             result = self.neo4j_rdf.query_single(query, {"qid": question_id})
@@ -312,6 +312,14 @@ class LocalExperiment:
 
         if context_mode == "none":
             return None, info, entity_names
+
+        if context_mode == "text":
+            try:
+                parsed = ast.literal_eval(references) if isinstance(references, str) else references
+                context = "\n".join(parsed) if isinstance(parsed, list) else str(references)
+            except (ValueError, SyntaxError):
+                context = str(references) if references else ""
+            return context if context else None, info, entity_names
 
         lpg_context = None
         lpg_subgraph = None

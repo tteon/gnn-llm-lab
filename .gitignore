@@ -1,0 +1,81 @@
+# Serena (local AI assistant config)
+.serena/
+
+# Example codebase (local reference only)
+example_codebase/
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+
+# Environment variables (contains secrets)
+.env
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Large data files (use Git LFS or download separately)
+data/neo4j/
+data/raw/*.parquet
+data/processed/*.parquet
+*.parquet
+
+# Embedding caches
+entity_embeddings*.npz
+*_cache.npz
+
+# Experiment results (optional: remove if you want to track)
+results/experiments/*.csv
+results/experiments/*.json
+results/checkpoints/
+results/logs/*.txt
+results/logs/*.log
+results/*.json
+
+# Model files
+*.pt
+*.pth
+*.bin
+*.onnx
+
+# HuggingFace cache
+.cache/
+huggingface/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.cache
+
+# Legacy notebooks
+notebooks/_legacy/
+
+# mypy cache
+.mypy_cache/
+
+# pytest cache
+.pytest_cache/
+
+# coverage reports
+htmlcov/
+.coverage
+coverage.xml

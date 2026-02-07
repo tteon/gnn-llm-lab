@@ -43,11 +43,15 @@ uv run black --check src/
 
 | File | Purpose |
 |------|---------|
+| `src/run_experiment.py` | **Main experiment runner** (3-axis: models × contexts × few-shot) |
+| `src/models.py` | GAT (`MessagePassingGNN`) and TransE (`TransEEncoder`) models |
 | `src/load_finder_kg.py` | Parquet → Neo4j data loader |
 | `src/llm_baseline.py` | LLM baseline experiments |
-| `src/experiment_colab.py` | Unified experiment runner |
+| `src/experiment_colab.py` | Unified experiment runner (Colab) |
 | `src/soft_vs_hard_experiment.py` | Soft vs Hard prompt comparison |
+| `src/attention_experiment.py` | **LPG vs RDF attention analysis** (5 conditions × attention metrics) |
 | `notebooks/finder_full_comparison.ipynb` | Main Colab experiment notebook |
+| `docs/attention_experiment_design.md` | Attention experiment design doc (hypotheses, metrics, analysis plan) |
 
 ## Utilities (`src/utils/`)
 
@@ -62,12 +66,17 @@ from src.utils import (
 
 | Module | Purpose |
 |--------|---------|
-| `config.py` | Dataclass configs with validation, .env support |
+| `config.py` | Dataclass configs (`ExperimentConfig`, `AttentionConfig`, `FewShotConfig`, `TrainingConfig`) with validation, .env support |
 | `neo4j_client.py` | Neo4j client with exponential backoff retry |
-| `formatting.py` | Graph → text conversion (structured/natural/triple/csv) |
+| `formatting.py` | Graph → text conversion (structured/natural/triple/csv) + `format_combined()` + `clean_rdf_uri()` / `format_rdf_cleaned()` for prefix-stripped RDF |
 | `logging_config.py` | Colored structured logging with file output |
 | `exceptions.py` | Custom exceptions: `ConfigurationError`, `Neo4jConnectionError`, `DataLoadError`, `ModelLoadError`, `GraphProcessingError` |
 | `reproducibility.py` | Seed setting, experiment metadata tracking |
+| `local_llm.py` | `LocalLLMManager` with MODEL_REGISTRY (llama8b/70b, mixtral, qwen_moe) |
+| `attention.py` | `AttentionExtractor` for generation→context attention maps (supports per-head mode via `aggregate_heads="none"`) |
+| `attention_analysis.py` | `AttentionAnalyzer` — entropy, entity coverage@K, prefix waste ratio, semantic density, per-head stats |
+| `few_shot.py` | `FewShotSelector` centroid-nearest per-category sampling |
+| `evaluation.py` | `Evaluator` (EM, F1, ROUGE, BERTScore) |
 
 ## Neo4j Databases
 
@@ -78,14 +87,79 @@ from src.utils import (
 
 Connection: `bolt://localhost:7687`, credentials: `neo4j` / `password`
 
-## Experiment Data Flow
+### Schema Details
+
+See [docs/neo4j_schema.md](docs/neo4j_schema.md) for full schema and query patterns.
+
+## Experiment Runner (`src/run_experiment.py`)
+
+Two modes of operation:
+- **Legacy mode** (`--experiments`): `llm`, `text_rag`, `graph_lpg`, `graph_rdf` → mapped to context modes
+- **New mode** (`--contexts`): `none`, `text`, `lpg`, `rdf`, `lpg_rdf` + `--models` + `--few-shot`
+
+### Context Conditions (5 types)
+
+| Context | Source | Description |
+|---------|--------|-------------|
+| `none` | — | LLM only, no context |
+| `text` | Parquet `references` column | Text RAG (parsed via `ast.literal_eval`) |
+| `lpg` | `finderlpg` Neo4j DB | GAT on LPG → formatted graph context |
+| `rdf` | `finderrdf` Neo4j DB | TransE on RDF triples → triple context |
+| `lpg_rdf` | Both DBs | Combined LPG + RDF context |
+
+### Experiment Data Flow
 
 ```
-[A] LLM Only:   Question → LLM → Answer
-[B] Text RAG:   Question + References → LLM → Answer
-[C] Graph LPG:  Question → Neo4j → GAT → Context → LLM → Answer
-[D] Graph RDF:  Question → Neo4j → TransE → Context → LLM → Answer
+[A] none:     Question → LLM → Answer
+[B] text:     Question + References → LLM → Answer
+[C] lpg:      Question → Neo4j(finderlpg) → GAT → Context → LLM → Answer
+[D] rdf:      Question → Neo4j(finderrdf) → TransE → Context → LLM → Answer
+[E] lpg_rdf:  Question → Neo4j(both) → GAT+TransE → Combined Context → LLM → Answer
 ```
+
+### Running Experiments
+
+```bash
+# Legacy mode
+uv run python src/run_experiment.py --experiments llm text_rag graph_lpg graph_rdf --sample-size 50
+
+# New mode (3-axis: models × contexts × few-shot)
+uv run python src/run_experiment.py --contexts none text lpg rdf --sample-size 50 --no-bertscore
+```
+
+## Attention Experiment (`src/attention_experiment.py`)
+
+Compares how LPG vs RDF graph serialization affects LLM attention patterns. Design doc: [`docs/attention_experiment_design.md`](docs/attention_experiment_design.md)
+
+### 5 Conditions
+
+| Condition | Context Source | Format |
+|-----------|---------------|--------|
+| `lpg_structured` | finderlpg | `GraphFormatter.format()` structured |
+| `lpg_natural` | finderlpg | `GraphFormatter.format()` natural |
+| `rdf_raw` | finderrdf | `GraphFormatter.format()` triple (raw URIs) |
+| `rdf_cleaned` | finderrdf | `GraphFormatter.format_rdf_cleaned()` (prefix-stripped) |
+| `no_context` | — | No graph context |
+
+### Metrics
+
+- **Attention**: entropy, entity_coverage@K, prefix_waste_ratio, semantic_density, per-head entropy stats
+- **Quality**: EM, F1, ROUGE-L
+
+### Running
+
+```bash
+# Full experiment (requires GPU + Neo4j running)
+uv run python src/attention_experiment.py --sample-size 50 --model meta-llama/Meta-Llama-3.1-8B-Instruct
+
+# Subset of conditions
+uv run python src/attention_experiment.py --conditions lpg_structured rdf_raw no_context --sample-size 20
+```
+
+### Data Dependencies
+
+- `data/processed/common_question_ids.json` — 1,332 questions with data in both LPG and RDF databases
+- Neo4j databases `finderlpg` and `finderrdf` must be running
 
 ## Development Guidelines
 

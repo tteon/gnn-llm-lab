@@ -44,12 +44,17 @@ uv run black --check src/
 | File | Purpose |
 |------|---------|
 | `src/run_experiment.py` | **Main experiment runner** (3-axis: models × contexts × few-shot) |
+| `src/kvcache_experiment.py` | **KV cache offloading experiment** (5-condition cold/warm latency comparison) |
+| `src/attention_experiment.py` | **LPG vs RDF attention analysis** (5 conditions × attention metrics) |
 | `src/models.py` | GAT (`MessagePassingGNN`) and TransE (`TransEEncoder`) models |
+| `src/train_gnn.py` | GNN model training (GAT, GCN, GraphTransformer) |
+| `src/train_kge.py` | KGE model training (TransE, DistMult, ComplEx, RotatE) |
+| `src/evaluation.py` | Link prediction metrics (MRR, Hits@K) |
 | `src/load_finder_kg.py` | Parquet → Neo4j data loader |
 | `src/llm_baseline.py` | LLM baseline experiments |
 | `src/experiment_colab.py` | Unified experiment runner (Colab) |
 | `src/soft_vs_hard_experiment.py` | Soft vs Hard prompt comparison |
-| `src/attention_experiment.py` | **LPG vs RDF attention analysis** (5 conditions × attention metrics) |
+| `notebooks/kvcache_analysis.ipynb` | **KV cache experiment analysis** (12 sections, 9 charts) |
 | `notebooks/finder_full_comparison.ipynb` | Main Colab experiment notebook |
 | `docs/attention_experiment_design.md` | Attention experiment design doc (hypotheses, metrics, analysis plan) |
 

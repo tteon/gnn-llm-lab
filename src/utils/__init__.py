@@ -34,6 +34,7 @@ from .reproducibility import (
 )
 from .llm_client import LLMClient, LLMResponse
 from .attention import AttentionExtractor, AttentionResult
+from .attention_analysis import AttentionAnalyzer
 from .local_llm import LocalLLMManager, LocalLLMResponse, MODEL_REGISTRY
 from .few_shot import FewShotSelector
 from .evaluation import Evaluator, EvaluationResult
@@ -76,6 +77,7 @@ __all__ = [
     # Attention
     "AttentionExtractor",
     "AttentionResult",
+    "AttentionAnalyzer",
     # Local LLM
     "LocalLLMManager",
     "LocalLLMResponse",

@@ -27,6 +27,7 @@ class AttentionResult:
     layer_attention: Optional[Dict[int, np.ndarray]] = None  # layer_idx -> [num_ctx_tokens]
     entity_attention: Optional[Dict[str, float]] = None  # entity_name -> score
     top_k_tokens: Optional[List[Tuple[str, float]]] = None
+    per_head_attention: Optional[Dict[int, Dict[int, np.ndarray]]] = None  # {layer: {head: [num_ctx_tokens]}}
 
 
 class AttentionExtractor:
@@ -84,24 +85,45 @@ class AttentionExtractor:
 
         layer_attention_map = {}
         all_layer_scores = []
+        per_head_map: Dict[int, Dict[int, np.ndarray]] = {}
+        per_head_mode = self.config.aggregate_heads == "none"
+
+        gen_end = input_ids.shape[1]
 
         for layer_idx in layer_indices:
             attn = attentions[layer_idx]  # [1, heads, seq, seq]
 
-            # Aggregate heads
-            if self.config.aggregate_heads == "mean":
-                attn_agg = attn[0].mean(dim=0)  # [seq, seq]
-            else:  # max
-                attn_agg = attn[0].max(dim=0).values  # [seq, seq]
+            if per_head_mode:
+                # Per-head: extract each head individually
+                num_heads = attn.shape[1]
+                head_scores_map: Dict[int, np.ndarray] = {}
+                head_scores_list = []
 
-            # Slice: generated tokens -> context tokens
-            gen_end = input_ids.shape[1]
-            if generated_token_start < gen_end:
-                gen_to_ctx = attn_agg[generated_token_start:gen_end, ctx_start:ctx_end]
-                # Average over generated tokens
-                ctx_scores = gen_to_ctx.mean(dim=0).cpu().numpy()  # [num_ctx_tokens]
+                for h in range(num_heads):
+                    if generated_token_start < gen_end:
+                        gen_to_ctx = attn[0, h, generated_token_start:gen_end, ctx_start:ctx_end]
+                        h_scores = gen_to_ctx.mean(dim=0).cpu().numpy()
+                    else:
+                        h_scores = np.zeros(num_ctx_tokens)
+                    head_scores_map[h] = h_scores
+                    head_scores_list.append(h_scores)
+
+                per_head_map[layer_idx] = head_scores_map
+                # Layer-level aggregate = mean across heads (for backward compat)
+                ctx_scores = np.mean(head_scores_list, axis=0)
             else:
-                ctx_scores = np.zeros(num_ctx_tokens)
+                # Aggregate heads as before
+                if self.config.aggregate_heads == "mean":
+                    attn_agg = attn[0].mean(dim=0)  # [seq, seq]
+                else:  # max
+                    attn_agg = attn[0].max(dim=0).values  # [seq, seq]
+
+                # Slice: generated tokens -> context tokens
+                if generated_token_start < gen_end:
+                    gen_to_ctx = attn_agg[generated_token_start:gen_end, ctx_start:ctx_end]
+                    ctx_scores = gen_to_ctx.mean(dim=0).cpu().numpy()
+                else:
+                    ctx_scores = np.zeros(num_ctx_tokens)
 
             layer_attention_map[layer_idx] = ctx_scores
             all_layer_scores.append(ctx_scores)
@@ -138,6 +160,7 @@ class AttentionExtractor:
             layer_attention=layer_attention_map if not self.config.save_context_attention_only else None,
             entity_attention=entity_attn,
             top_k_tokens=top_k_list,
+            per_head_attention=per_head_map if per_head_mode else None,
         )
 
     @staticmethod
@@ -180,6 +203,11 @@ class AttentionExtractor:
             for layer_idx, scores in result.layer_attention.items():
                 save_dict[f"layer_{layer_idx}"] = scores
 
+        if result.per_head_attention:
+            for layer_idx, heads in result.per_head_attention.items():
+                for head_idx, scores in heads.items():
+                    save_dict[f"layer_{layer_idx}_head_{head_idx}"] = scores
+
         np.savez_compressed(str(save_path), **save_dict)
 
         # Save metadata as JSON alongside
@@ -188,6 +216,7 @@ class AttentionExtractor:
             "context_tokens": result.context_tokens,
             "top_k_tokens": result.top_k_tokens,
             "entity_attention": result.entity_attention,
+            "has_per_head": result.per_head_attention is not None,
         }
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
@@ -201,8 +230,20 @@ class AttentionExtractor:
         scores = data["context_attention_scores"]
 
         layer_attention = {}
+        per_head_attention: Dict[int, Dict[int, np.ndarray]] = {}
+
         for key in data.files:
-            if key.startswith("layer_"):
+            if key == "context_attention_scores":
+                continue
+            # Per-head keys: "layer_X_head_Y"
+            if "_head_" in key:
+                parts = key.split("_")  # ["layer", X, "head", Y]
+                layer_idx = int(parts[1])
+                head_idx = int(parts[3])
+                if layer_idx not in per_head_attention:
+                    per_head_attention[layer_idx] = {}
+                per_head_attention[layer_idx][head_idx] = data[key]
+            elif key.startswith("layer_"):
                 layer_idx = int(key.split("_")[1])
                 layer_attention[layer_idx] = data[key]
 
@@ -224,4 +265,5 @@ class AttentionExtractor:
             layer_attention=layer_attention if layer_attention else None,
             entity_attention=entity_attention,
             top_k_tokens=top_k_tokens,
+            per_head_attention=per_head_attention if per_head_attention else None,
         )

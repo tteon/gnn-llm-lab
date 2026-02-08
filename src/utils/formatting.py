@@ -5,6 +5,7 @@ Provides multiple formatting strategies for injecting graph context into LLMs.
 """
 
 import json
+import re
 from typing import Any, Dict, List, Literal, Optional
 
 from .logging_config import get_logger
@@ -413,6 +414,59 @@ class GraphFormatter:
             tgt = node_map.get(tgt, tgt)
 
         return f"{src} --[{rel}]--> {tgt}"
+
+    @classmethod
+    def clean_rdf_uri(cls, uri: str) -> str:
+        """Convert RDF URI to clean natural language token.
+
+        Strips ontology prefixes and converts camelCase to space-separated words.
+
+        Examples:
+            'fibo-fnd-rel-rel:hasCustomer' → 'has customer'
+            'ex:Apple' → 'Apple'
+            'fibo-fbc-fi-fi:hasOwnershipInterestIn' → 'has ownership interest in'
+            'rdf:type' → 'type'
+        """
+        # Extract local name after last ':'
+        if ":" in uri:
+            local = uri.split(":")[-1]
+        else:
+            local = uri
+
+        if not local:
+            return uri
+
+        # camelCase → space separated
+        result = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", local)
+
+        return result.lower().strip()
+
+    @classmethod
+    def format_rdf_cleaned(
+        cls,
+        edges: List[Dict[str, Any]],
+        max_edges: int = 50,
+    ) -> str:
+        """Format RDF triples with FIBO prefixes stripped.
+
+        Converts URIs to clean natural language for LLM consumption.
+
+        Args:
+            edges: RDF edge dicts with 'source', 'type', 'target' keys
+            max_edges: Maximum triples to include
+
+        Returns:
+            Formatted text like:
+            Knowledge triples:
+            (company, has customer, apple)
+        """
+        lines = ["Knowledge triples:"]
+        for e in edges[:max_edges]:
+            s = cls.clean_rdf_uri(e.get("source", e.get("src", "?")))
+            p = cls.clean_rdf_uri(e.get("type", e.get("relType", "related")))
+            o = cls.clean_rdf_uri(e.get("target", e.get("tgt", "?")))
+            lines.append(f"({s}, {p}, {o})")
+        return "\n".join(lines)
 
 
 def flatten_properties(props: Dict[str, Any]) -> Dict[str, Any]:

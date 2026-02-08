@@ -1,0 +1,22 @@
+{
+  "conditions": [
+    "lpg",
+    "rdf",
+    "text",
+    "lpg_rdf",
+    "vanilla"
+  ],
+  "sample_size": 50,
+  "seed": 42,
+  "max_tokens": 512,
+  "lmcache_wait_sec": 3.0,
+  "inter_question_wait": 1.0,
+  "output_dir": "results/kvcache_experiment",
+  "checkpoint_every": 10,
+  "neo4j_uri": "bolt://localhost:7687",
+  "neo4j_user": "neo4j",
+  "neo4j_password": "password",
+  "parquet_path": "data/raw/FinDER_KG_Merged.parquet",
+  "common_ids_path": "data/processed/common_question_ids.json",
+  "resume_dir": null
+}

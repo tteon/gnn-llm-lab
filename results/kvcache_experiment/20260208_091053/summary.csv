@@ -1,0 +1,2 @@
+condition,n_success,cold_latency_mean,cold_latency_std,warm_latency_mean,warm_latency_std,speedup_mean,speedup_std,prompt_tokens_mean,context_length_mean,warm_cache_hit_delta_mean,warm_cache_queries_delta_mean,em_mean,f1_mean,rouge_l_mean
+text,50,7.796131453514099,1.1476262041498058,7.753562669754029,1.099944521293295,1.0059794540331959,0.06583979743705537,456.54,1921.72,0.0,0.0,0.0,0.18885667480168666,0.18119112477456487

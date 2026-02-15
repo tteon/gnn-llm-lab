@@ -60,6 +60,16 @@ eval = [
     "bert-score>=0.3.13",
 ]
 
+# Opik experiment tracking & evaluation
+opik = [
+    "opik>=1.0.0",
+]
+
+# KG extraction pipeline
+pipeline = [
+    "datasets>=2.14.0",
+]
+
 # Development dependencies
 dev = [
     "pytest>=7.0.0",
@@ -72,7 +82,7 @@ dev = [
 
 # All dependencies
 all = [
-    "gnnllm-lab[ml,quantization,pcst,eval,dev]",
+    "gnnllm-lab[ml,quantization,pcst,eval,opik,pipeline,dev]",
 ]
 
 [project.urls]

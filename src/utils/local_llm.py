@@ -1,8 +1,8 @@
 """
 Local HuggingFace model manager for multi-model comparison experiments.
 
-Supports loading/unloading models with quantization, generating with attention
-extraction, and managing GPU memory across model switches.
+Supports loading/unloading models with quantization, generating responses,
+and managing GPU memory across model switches.
 """
 
 import gc
@@ -13,7 +13,6 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from .attention import AttentionConfig, AttentionExtractor, AttentionResult
 from .config import ModelConfig
 from .logging_config import get_logger
 
@@ -52,8 +51,6 @@ class LocalLLMResponse:
     output_tokens: int
     generation_time: float
     model: str
-    attention_data: Optional[AttentionResult] = None
-    context_token_range: Optional[Tuple[int, int]] = None
 
 
 class LocalLLMManager:
@@ -65,13 +62,11 @@ class LocalLLMManager:
         self.tokenizer = None
         self.current_model_id: Optional[str] = None
         self.current_alias: Optional[str] = None
-        self.attention_extractor: Optional[AttentionExtractor] = None
 
     def load_model(
         self,
         model_alias: str,
         quant_override: Optional[str] = None,
-        attention_config: Optional[AttentionConfig] = None,
     ) -> None:
         """
         Load a model from the registry.
@@ -79,7 +74,6 @@ class LocalLLMManager:
         Args:
             model_alias: Key in MODEL_REGISTRY (e.g. "llama8b")
             quant_override: Override quantization ("4bit", "8bit", None for bf16)
-            attention_config: Config for attention extraction
         """
         if model_alias not in MODEL_REGISTRY:
             raise ValueError(
@@ -111,10 +105,9 @@ class LocalLLMManager:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Build quantization config
+        # Build model loading config
         load_kwargs = {
             "device_map": self.model_config.llm_device_map,
-            "attn_implementation": "eager",  # Required for output_attentions
             **token_kwargs,
         }
 
@@ -140,10 +133,6 @@ class LocalLLMManager:
         self.current_model_id = model_id
         self.current_alias = model_alias
 
-        # Setup attention extractor
-        if attention_config and attention_config.enabled:
-            self.attention_extractor = AttentionExtractor(attention_config)
-
         param_count = sum(p.numel() for p in self.model.parameters())
         if torch.cuda.is_available():
             mem_gb = torch.cuda.memory_allocated() / 1e9
@@ -166,7 +155,6 @@ class LocalLLMManager:
             self.tokenizer = None
         self.current_model_id = None
         self.current_alias = None
-        self.attention_extractor = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -181,26 +169,20 @@ class LocalLLMManager:
         few_shot_examples: Optional[List[Dict[str, str]]] = None,
         max_new_tokens: int = 256,
         temperature: float = 0.0,
-        extract_attention: bool = False,
-        attention_config: Optional[AttentionConfig] = None,
-        entity_names: Optional[List[str]] = None,
     ) -> LocalLLMResponse:
         """
-        Generate a response with optional attention extraction.
+        Generate a response from the loaded model.
 
         Args:
             question: The question to answer
-            context: Optional graph/text context
+            context: Optional graph/text context (soft prompt)
             system_prompt: Optional system prompt
             few_shot_examples: List of {"role": ..., "content": ...} message pairs
             max_new_tokens: Max tokens to generate
             temperature: Sampling temperature
-            extract_attention: Whether to extract attention scores
-            attention_config: Attention extraction config
-            entity_names: Entity names for attention aggregation
 
         Returns:
-            LocalLLMResponse with text, usage, and optional attention
+            LocalLLMResponse with text, usage info
         """
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("No model loaded. Call load_model() first.")
@@ -214,11 +196,6 @@ class LocalLLMManager:
         )
         inputs = self.tokenizer(prompt_text, return_tensors="pt").to(self.model.device)
         input_len = inputs["input_ids"].shape[1]
-
-        # Find context token range if context provided
-        context_token_range = None
-        if context and extract_attention:
-            context_token_range = self._find_context_range(prompt_text, context, inputs["input_ids"])
 
         # Generate
         start_time = time.time()
@@ -240,28 +217,10 @@ class LocalLLMManager:
         response_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
         output_tokens = len(generated_ids)
 
-        # Extract attention if requested
-        attention_data = None
-        if extract_attention and context_token_range and self.attention_extractor:
-            attn_config = attention_config or (
-                self.attention_extractor.config if self.attention_extractor else None
-            )
-            if attn_config:
-                try:
-                    attention_data = self.attention_extractor.extract(
-                        model=self.model,
-                        input_ids=output_ids,
-                        tokenizer=self.tokenizer,
-                        context_token_range=context_token_range,
-                        generated_token_start=input_len,
-                        entity_names=entity_names,
-                    )
-                except Exception as e:
-                    logger.warning(f"Attention extraction failed: {e}")
-
         # Clean up
         del inputs, output_ids
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return LocalLLMResponse(
             text=response_text,
@@ -269,8 +228,6 @@ class LocalLLMManager:
             output_tokens=output_tokens,
             generation_time=generation_time,
             model=self.current_alias or self.current_model_id or "unknown",
-            attention_data=attention_data,
-            context_token_range=context_token_range,
         )
 
     def _build_messages(
@@ -306,36 +263,3 @@ class LocalLLMManager:
             messages.append({"role": "user", "content": question})
 
         return messages
-
-    def _find_context_range(
-        self,
-        prompt_text: str,
-        context: str,
-        input_ids: torch.Tensor,
-    ) -> Optional[Tuple[int, int]]:
-        """Find token range of context within the prompt."""
-        # Find context substring in prompt
-        ctx_start_char = prompt_text.find(context)
-        if ctx_start_char == -1:
-            # Try truncated match
-            ctx_start_char = prompt_text.find(context[:100])
-            if ctx_start_char == -1:
-                logger.debug("Could not locate context in prompt for attention extraction")
-                return None
-
-        # Encode prefix to find token offset
-        prefix = prompt_text[:ctx_start_char]
-        prefix_tokens = self.tokenizer(prefix, add_special_tokens=False)["input_ids"]
-        ctx_tokens = self.tokenizer(context, add_special_tokens=False)["input_ids"]
-
-        start_idx = len(prefix_tokens)
-        end_idx = start_idx + len(ctx_tokens)
-
-        # Clamp to input length
-        seq_len = input_ids.shape[1]
-        end_idx = min(end_idx, seq_len)
-
-        if start_idx >= end_idx:
-            return None
-
-        return (start_idx, end_idx)

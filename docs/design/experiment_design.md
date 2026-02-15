@@ -1,7 +1,7 @@
 # FinDER KG 실험 설계서
 
 > **목표**: LPG(GNN) vs RDF(KGE) 기반 Graph RAG 성능 비교
-> **참조**: [gnn_kge_focused_analysis.md](./gnn_kge_focused_analysis.md)
+> **참조**: [gnn_kge_focused_analysis.md](../analysis/gnn_kge_focused_analysis.md)
 
 ---
 

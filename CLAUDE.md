@@ -4,59 +4,65 @@ Instructions for Claude Code when working with this repository.
 
 ## Project Overview
 
-GNN+LLM experiment lab comparing Graph RAG approaches (GAT on LPG vs TransE on RDF) using the FinDER Knowledge Graph dataset with Llama 3.1 8B as the generation model.
+Soft-prompt Graph RAG experiment lab comparing text-serialized graph context approaches (LPG vs RDF) using the FinDER Knowledge Graph dataset with local HuggingFace models (Llama 3.1 8B Instruct, etc.).
 
-See [README.md](README.md) for architecture details and experiment descriptions.
+Subgraphs are fetched from Neo4j and formatted as text (soft prompt) — no GNN/KGE embeddings are used at inference time.
+
+See [README.md](README.md) for architecture details.
 
 ## Tech Stack
 
 - **Python 3.10** with UV package manager
 - **Neo4j/DozerDB 5.26.3** - Graph database (Docker, multi-database)
-- **PyTorch + PyTorch Geometric** - GNN models (GAT, TransE)
-- **Hugging Face Transformers** - LLM (Llama 3.1 8B Instruct)
-- **Sentence-Transformers** - Node embeddings (all-MiniLM-L6-v2, 384-dim)
-- **Google Colab** - A100 GPU runtime
+- **PyTorch** - Model loading and GPU management
+- **Hugging Face Transformers** - LLM (Llama 3.1 8B Instruct, Mixtral, Qwen MoE)
+- **Sentence-Transformers** - For few-shot example selection (all-MiniLM-L6-v2, 384-dim)
 
 ## Commands
 
 ```bash
 # Setup
-./setup.sh
-cp .env.example .env
+make setup                    # Install dependencies
+cp .env.example .env          # Configure API keys
 
-# Neo4j
-docker-compose up -d
-uv run python src/load_finder_kg.py
+# Full reproducible pipeline (download → extract → Neo4j)
+make pipeline
+
+# Individual stages
+make download                 # Stage 1: HuggingFace → data/raw/FinDER.parquet
+make build-kg                 # Stage 2: LLM extraction → FinDER_KG_Merged.parquet
+make load-neo4j               # Stage 3: Parquet → Neo4j
 
 # Run experiments
-uv run python src/experiment_colab.py
+make experiment               # Opik experiment (default config)
+uv run python src/run_experiment.py --models llama8b --contexts none lpg rdf --sample-size 50
 
-# Tests
-uv run pytest tests/
-
-# Linting
-uv run ruff check src/
-uv run black --check src/
+# Tests & Lint
+make test
+make lint
 ```
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
+| `scripts/download_dataset.py` | **Stage 1**: HuggingFace FinDER → `data/raw/FinDER.parquet` |
+| `scripts/build_kg.py` | **Stage 2**: LLM entity extraction → `FinDER_KG_Merged.parquet` |
+| `src/load_finder_kg.py` | **Stage 3**: Parquet → Neo4j (finderlpg + finderrdf) |
 | `src/run_experiment.py` | **Main experiment runner** (3-axis: models × contexts × few-shot) |
-| `src/kvcache_experiment.py` | **KV cache offloading experiment** (5-condition cold/warm latency comparison) |
-| `src/attention_experiment.py` | **LPG vs RDF attention analysis** (5 conditions × attention metrics) |
-| `src/models.py` | GAT (`MessagePassingGNN`) and TransE (`TransEEncoder`) models |
-| `src/train_gnn.py` | GNN model training (GAT, GCN, GraphTransformer) |
-| `src/train_kge.py` | KGE model training (TransE, DistMult, ComplEx, RotatE) |
-| `src/evaluation.py` | Link prediction metrics (MRR, Hits@K) |
-| `src/load_finder_kg.py` | Parquet → Neo4j data loader |
-| `src/llm_baseline.py` | LLM baseline experiments |
-| `src/experiment_colab.py` | Unified experiment runner (Colab) |
-| `src/soft_vs_hard_experiment.py` | Soft vs Hard prompt comparison |
-| `notebooks/kvcache_analysis.ipynb` | **KV cache experiment analysis** (12 sections, 9 charts) |
-| `notebooks/finder_full_comparison.ipynb` | Main Colab experiment notebook |
-| `docs/attention_experiment_design.md` | Attention experiment design doc (hypotheses, metrics, analysis plan) |
+| `src/opik_experiment.py` | **Opik-integrated experiment driver** (tracing, evaluation, LLM-as-Judge) |
+| `prompts/*.yaml` | Entity extraction/linking prompt templates (FIBO + base) |
+| `Makefile` | Pipeline automation (`make pipeline`) |
+| `KNOWN_ISSUES.md` | Known issues & improvement backlog |
+| `docs/INDEX.md` | Documentation index |
+
+### Legacy Files (`src/_legacy/`)
+
+GNN/KGE/attention/kvcache 관련 코드가 보존되어 있음:
+- `models.py`, `train_gnn.py`, `train_kge.py`, `evaluation.py` — GNN/KGE 모델 및 학습
+- `attention_experiment.py`, `utils/attention.py`, `utils/attention_analysis.py` — Attention 분석
+- `kvcache_experiment.py` — KV cache offloading 실험
+- `experiment_colab.py`, `soft_vs_hard_experiment.py`, `llm_baseline.py`, `data.py` — 이전 실험
 
 ## Utilities (`src/utils/`)
 
@@ -71,15 +77,14 @@ from src.utils import (
 
 | Module | Purpose |
 |--------|---------|
-| `config.py` | Dataclass configs (`ExperimentConfig`, `AttentionConfig`, `FewShotConfig`, `TrainingConfig`) with validation, .env support |
+| `config.py` | Dataclass configs (`ExperimentConfig`, `FewShotConfig`) with validation, .env support |
 | `neo4j_client.py` | Neo4j client with exponential backoff retry |
 | `formatting.py` | Graph → text conversion (structured/natural/triple/csv) + `format_combined()` + `clean_rdf_uri()` / `format_rdf_cleaned()` for prefix-stripped RDF |
 | `logging_config.py` | Colored structured logging with file output |
 | `exceptions.py` | Custom exceptions: `ConfigurationError`, `Neo4jConnectionError`, `DataLoadError`, `ModelLoadError`, `GraphProcessingError` |
 | `reproducibility.py` | Seed setting, experiment metadata tracking |
 | `local_llm.py` | `LocalLLMManager` with MODEL_REGISTRY (llama8b/70b, mixtral, qwen_moe) |
-| `attention.py` | `AttentionExtractor` for generation→context attention maps (supports per-head mode via `aggregate_heads="none"`) |
-| `attention_analysis.py` | `AttentionAnalyzer` — entropy, entity coverage@K, prefix waste ratio, semantic density, per-head stats |
+| `llm_client.py` | OpenAI-compatible API client (vLLM) |
 | `few_shot.py` | `FewShotSelector` centroid-nearest per-category sampling |
 | `evaluation.py` | `Evaluator` (EM, F1, ROUGE, BERTScore) |
 
@@ -94,7 +99,7 @@ Connection: `bolt://localhost:7687`, credentials: `neo4j` / `password`
 
 ### Schema Details
 
-See [docs/neo4j_schema.md](docs/neo4j_schema.md) for full schema and query patterns.
+See [docs/reference/neo4j_schema.md](docs/reference/neo4j_schema.md) for full schema and query patterns.
 
 ## Experiment Runner (`src/run_experiment.py`)
 
@@ -108,63 +113,115 @@ Two modes of operation:
 |---------|--------|-------------|
 | `none` | — | LLM only, no context |
 | `text` | Parquet `references` column | Text RAG (parsed via `ast.literal_eval`) |
-| `lpg` | `finderlpg` Neo4j DB | GAT on LPG → formatted graph context |
-| `rdf` | `finderrdf` Neo4j DB | TransE on RDF triples → triple context |
-| `lpg_rdf` | Both DBs | Combined LPG + RDF context |
+| `lpg` | `finderlpg` Neo4j DB | Subgraph → text formatted graph context |
+| `rdf` | `finderrdf` Neo4j DB | Triples → prefix-stripped text context |
+| `lpg_rdf` | Both DBs | Combined LPG + RDF text context |
 
-### Experiment Data Flow
+### Experiment Data Flow (Soft Prompt)
 
 ```
 [A] none:     Question → LLM → Answer
 [B] text:     Question + References → LLM → Answer
-[C] lpg:      Question → Neo4j(finderlpg) → GAT → Context → LLM → Answer
-[D] rdf:      Question → Neo4j(finderrdf) → TransE → Context → LLM → Answer
-[E] lpg_rdf:  Question → Neo4j(both) → GAT+TransE → Combined Context → LLM → Answer
+[C] lpg:      Question → Neo4j(finderlpg) → GraphFormatter → Text Context → LLM → Answer
+[D] rdf:      Question → Neo4j(finderrdf) → format_rdf_cleaned → Text Context → LLM → Answer
+[E] lpg_rdf:  Question → Neo4j(both) → format_combined → Text Context → LLM → Answer
 ```
 
 ### Running Experiments
 
 ```bash
-# Legacy mode
-uv run python src/run_experiment.py --experiments llm text_rag graph_lpg graph_rdf --sample-size 50
+# Quick smoke test
+uv run python src/run_experiment.py --models llama8b --contexts none lpg --sample-size 2 --no-bertscore
 
-# New mode (3-axis: models × contexts × few-shot)
-uv run python src/run_experiment.py --contexts none text lpg rdf --sample-size 50 --no-bertscore
+# Full matrix
+uv run python src/run_experiment.py --models llama8b --contexts none text lpg rdf lpg_rdf --few-shot --sample-size 50
+
+# Legacy mode (API-based)
+uv run python src/run_experiment.py --experiments llm text_rag graph_lpg graph_rdf --sample-size 50
 ```
 
-## Attention Experiment (`src/attention_experiment.py`)
+## Opik Experiment (`src/opik_experiment.py`)
 
-Compares how LPG vs RDF graph serialization affects LLM attention patterns. Design doc: [`docs/attention_experiment_design.md`](docs/attention_experiment_design.md)
+Opik-integrated driver with tracing, evaluation dashboard, and LLM-as-Judge metrics.
 
-### 5 Conditions
-
-| Condition | Context Source | Format |
-|-----------|---------------|--------|
-| `lpg_structured` | finderlpg | `GraphFormatter.format()` structured |
-| `lpg_natural` | finderlpg | `GraphFormatter.format()` natural |
-| `rdf_raw` | finderrdf | `GraphFormatter.format()` triple (raw URIs) |
-| `rdf_cleaned` | finderrdf | `GraphFormatter.format_rdf_cleaned()` (prefix-stripped) |
-| `no_context` | — | No graph context |
+**Prerequisites:**
+- Self-hosted Opik server: `git clone https://github.com/comet-ml/opik.git && cd opik && ./opik.sh` → `http://localhost:5173`
+- Install SDK: `uv pip install opik`
+- `OPENAI_API_KEY` in `.env` (for LLM-as-Judge)
 
 ### Metrics
 
-- **Attention**: entropy, entity_coverage@K, prefix_waste_ratio, semantic_density, per-head entropy stats
-- **Quality**: EM, F1, ROUGE-L
+| Type | Metrics |
+|------|---------|
+| Heuristic | ExactMatch, TokenF1, ROUGE-1/2/L, BERTScore |
+| LLM-as-Judge | AnswerRelevance, Hallucination, ContextPrecision |
 
-### Running
+### Running with Opik
 
 ```bash
-# Full experiment (requires GPU + Neo4j running)
-uv run python src/attention_experiment.py --sample-size 50 --model meta-llama/Meta-Llama-3.1-8B-Instruct
+# Smoke test (heuristic only)
+uv run python src/opik_experiment.py \
+    --models llama8b --contexts none lpg --sample-size 2 --no-judge --no-bertscore
 
-# Subset of conditions
-uv run python src/attention_experiment.py --conditions lpg_structured rdf_raw no_context --sample-size 20
+# Full matrix + LLM-as-Judge
+uv run python src/opik_experiment.py \
+    --models llama8b mixtral --contexts none lpg rdf lpg_rdf \
+    --few-shot --sample-size 100 --judge-model gpt-4o-mini
+
+# Dashboard: http://localhost:5173 → Project "FinDER_GraphRAG"
 ```
 
-### Data Dependencies
+## Reproduction Pipeline
 
-- `data/processed/common_question_ids.json` — 1,332 questions with data in both LPG and RDF databases
-- Neo4j databases `finderlpg` and `finderrdf` must be running
+End-to-end pipeline for reproducing the entire experiment from scratch.
+
+### Prerequisites
+
+- `.env` with: `HF_TOKEN`, `OPENAI_API_KEY` (for extraction), `NEO4J_*` credentials
+- Docker (for Neo4j and Opik)
+- GPU (for local LLM inference)
+
+### Data Pipeline
+
+```
+HuggingFace (Linq-AI-Research/FinDER, 5,703 QA pairs)
+    ↓ scripts/download_dataset.py
+data/raw/FinDER.parquet (7 columns)
+    ↓ scripts/build_kg.py (LLM entity extraction + FIBO URI mapping)
+data/raw/FinDER_KG_Merged.parquet (+lpg_nodes, lpg_edges, rdf_triples)
+    ↓ src/load_finder_kg.py
+Neo4j (finderlpg + finderrdf)
+    ↓ src/opik_experiment.py
+Opik Dashboard (http://localhost:5173)
+```
+
+### Prompt Templates (`prompts/`)
+
+| Prompt | Category | Output |
+|--------|----------|--------|
+| `fibo_extraction.yaml` | Financials | COMPANY_NAME, FINANCIAL_TERM, CURRENCY, REGULATION, INSTRUMENT |
+| `fibo_linking.yaml` | Financials | OWNS, INCURRED, REPORTED, HAS_VALUE, COMPLY_WITH |
+| `base_extraction.yaml` | General | Organization, Person, Location, Event, Date, Concept |
+| `base_linking.yaml` | General | LOCATED_IN, WORKS_FOR, PART_OF, RELATED_TO, HAPPENED_ON |
+| `entity_dedup.yaml` | All | Duplicate detection + linked_id assignment |
+
+### KG Build Script (`scripts/build_kg.py`)
+
+```bash
+# Full extraction (~17K API calls, ~30min at 500 RPM)
+uv run python scripts/build_kg.py
+
+# Test with small subset
+uv run python scripts/build_kg.py --sample-size 10
+
+# Resume from checkpoint
+uv run python scripts/build_kg.py --resume
+
+# Use different model/rate
+uv run python scripts/build_kg.py --model gpt-4o --rpm 100
+```
+
+Checkpoints: `data/intermediate/kg_extraction.jsonl` (JSONL, line-per-sample)
 
 ## Development Guidelines
 
@@ -191,10 +248,11 @@ uv run python src/attention_experiment.py --conditions lpg_structured rdf_raw no
 ### GPU/Memory
 - `torch.bfloat16` for memory efficiency
 - `torch.cuda.empty_cache()` between samples
-- `attn_implementation="eager"` when flash_attn unavailable
 
-### Reference Implementation
-See `example_codebase/neo4j-gnn-llm-example/` for STaRK QA reference:
-- `STaRKQADataset.py` - Full pipeline
-- `compute_pcst.py` - PCST subgraph pruning
-- `train.py` - GNN+LLM training loop
+## Known Issues & Improvement Backlog
+
+See [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the full prioritized list of known problems and improvement tasks.
+
+## Documentation
+
+See [`docs/INDEX.md`](docs/INDEX.md) for the complete documentation map organized by MECE categories (Design / Analysis / Reference / External).

@@ -1,20 +1,22 @@
 """
-Utility modules for GNN+LLM experiments.
+Utility modules for Graph RAG soft-prompt experiments.
 
 Provides:
 - Structured logging
 - Configuration management with validation
 - Robust Neo4j client with retry logic
-- Graph formatting utilities
+- Graph formatting utilities (graph → text context)
 - Custom exceptions
 - Reproducibility utilities
-- OpenAI-compatible LLM client
+- LLM client (OpenAI-compatible API + local HF models)
+- Few-shot selection
+- Quality evaluation (EM, F1, ROUGE, BERTScore)
 """
 
 from .logging_config import setup_logging, get_logger
 from .config import (
     BaseConfig, Neo4jConfig, ModelConfig, ExperimentConfig,
-    AttentionConfig, FewShotConfig, TrainingConfig, load_config,
+    FewShotConfig, load_config,
 )
 from .exceptions import (
     GNNLLMError,
@@ -33,8 +35,6 @@ from .reproducibility import (
     ExperimentTracker,
 )
 from .llm_client import LLMClient, LLMResponse
-from .attention import AttentionExtractor, AttentionResult
-from .attention_analysis import AttentionAnalyzer
 from .local_llm import LocalLLMManager, LocalLLMResponse, MODEL_REGISTRY
 from .few_shot import FewShotSelector
 from .evaluation import Evaluator, EvaluationResult
@@ -48,6 +48,7 @@ __all__ = [
     "Neo4jConfig",
     "ModelConfig",
     "ExperimentConfig",
+    "FewShotConfig",
     "load_config",
     # Exceptions
     "GNNLLMError",
@@ -70,14 +71,6 @@ __all__ = [
     # LLM Client
     "LLMClient",
     "LLMResponse",
-    # Config (extended)
-    "AttentionConfig",
-    "FewShotConfig",
-    "TrainingConfig",
-    # Attention
-    "AttentionExtractor",
-    "AttentionResult",
-    "AttentionAnalyzer",
     # Local LLM
     "LocalLLMManager",
     "LocalLLMResponse",

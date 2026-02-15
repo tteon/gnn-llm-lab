@@ -344,12 +344,17 @@ class OpikGraphRAGExperiment:
 
         Trace hierarchy:
             graph_rag_pipeline (top-level)
-            ├── router_agent          — context routing decision
-            ├── lpg_retrieval_agent   — Neo4j finderlpg (conditional)
-            ├── rdf_retrieval_agent   — Neo4j finderrdf (conditional)
-            └── answer_generation_agent — LLM generation
+            ├── router_agent               — context routing decision
+            ├── lpg_retrieval_agent         — Neo4j finderlpg (conditional)
+            ├── rdf_retrieval_agent         — Neo4j finderrdf (conditional)
+            ├── context_formatting          — raw data → text serialization
+            └── answer_generation_agent     — LLM generation
         """
         experiment = self
+
+        # Closure storage for raw retrieval data
+        # (avoids serializing large node/edge lists in Opik trace output)
+        _raw = {"lpg_nodes": [], "lpg_edges": [], "rdf_edges": []}
 
         # --- Agent functions (nested, each @opik.track) ---
 
@@ -384,13 +389,15 @@ class OpikGraphRAGExperiment:
             )
             nodes = subgraph.get("nodes", [])
             edges = subgraph.get("edges", [])
+            _raw["lpg_nodes"] = nodes
+            _raw["lpg_edges"] = edges
             info = {"lpg_nodes": len(nodes), "lpg_edges": len(edges)}
             names = (
                 [n.get("name", n.get("id", "")) for n in nodes] if nodes else []
             )
             if nodes:
                 opik_context.update_current_span(metadata=info)
-            return nodes, edges, info, names
+            return info, names
 
         @opik.track(name="rdf_retrieval_agent")
         def rdf_retrieval_agent(question_id):
@@ -398,10 +405,49 @@ class OpikGraphRAGExperiment:
             subgraph = experiment._load_subgraph_rdf(question_id)
             rdf_nodes = subgraph.get("nodes", [])
             rdf_edges = subgraph.get("edges", [])
+            _raw["rdf_edges"] = rdf_edges
             info = {"rdf_nodes": len(rdf_nodes), "rdf_edges": len(rdf_edges)}
             if rdf_edges:
                 opik_context.update_current_span(metadata=info)
-            return rdf_edges, info
+            return info
+
+        @opik.track(name="context_formatting")
+        def format_context(route_decision, text_context):
+            """Format raw retrieval data into text context for LLM."""
+            context = None
+            if route_decision == "none":
+                pass
+            elif route_decision == "text":
+                context = text_context
+            elif route_decision == "lpg":
+                if _raw["lpg_nodes"]:
+                    context = GraphFormatter.format(
+                        nodes=_raw["lpg_nodes"],
+                        edges=_raw["lpg_edges"],
+                        style=experiment.config.soft_prompt_format,
+                        max_nodes=experiment.config.max_context_nodes,
+                        max_edges=experiment.config.max_context_edges,
+                    )
+            elif route_decision == "rdf":
+                if _raw["rdf_edges"]:
+                    context = GraphFormatter.format_rdf_cleaned(
+                        _raw["rdf_edges"][:40]
+                    )
+            elif route_decision == "lpg_rdf":
+                if _raw["lpg_nodes"] or _raw["rdf_edges"]:
+                    context = GraphFormatter.format_combined(
+                        lpg_nodes=_raw["lpg_nodes"],
+                        lpg_edges=_raw["lpg_edges"],
+                        rdf_edges=_raw["rdf_edges"],
+                        style=experiment.config.soft_prompt_format,
+                    )
+            opik_context.update_current_span(
+                metadata={
+                    "route": route_decision,
+                    "context_chars": len(context) if context else 0,
+                }
+            )
+            return context
 
         @opik.track(name="answer_generation_agent")
         def answer_generation_agent(question, context, few_shot_examples):
@@ -420,7 +466,13 @@ class OpikGraphRAGExperiment:
                     "generation_time": resp.generation_time,
                 }
             )
-            return resp
+            return {
+                "text": resp.text,
+                "input_tokens": resp.input_tokens,
+                "output_tokens": resp.output_tokens,
+                "generation_time": resp.generation_time,
+                "model": resp.model,
+            }
 
         # --- Top-level task function ---
 
@@ -431,14 +483,17 @@ class OpikGraphRAGExperiment:
             category = item.get("category", "")
             references = item.get("references", "")
 
+            # Reset raw storage per question
+            _raw["lpg_nodes"] = []
+            _raw["lpg_edges"] = []
+            _raw["rdf_edges"] = []
+
             # Agent 1: Router
             route_decision, text_context = router_agent(
                 question, context_mode, references
             )
 
             # Agent 2/3: Retrieval (conditional)
-            lpg_nodes, lpg_edges = [], []
-            rdf_edges_raw = []
             subgraph_info = {
                 "lpg_nodes": 0, "lpg_edges": 0,
                 "rdf_nodes": 0, "rdf_edges": 0,
@@ -446,44 +501,16 @@ class OpikGraphRAGExperiment:
             entity_names = []
 
             if route_decision in ("lpg", "lpg_rdf") and experiment.neo4j_lpg:
-                lpg_nodes, lpg_edges, lpg_info, names = lpg_retrieval_agent(
-                    question_id
-                )
+                lpg_info, names = lpg_retrieval_agent(question_id)
                 subgraph_info.update(lpg_info)
                 entity_names.extend(names)
 
             if route_decision in ("rdf", "lpg_rdf") and experiment.neo4j_rdf:
-                rdf_edges_raw, rdf_info = rdf_retrieval_agent(question_id)
+                rdf_info = rdf_retrieval_agent(question_id)
                 subgraph_info.update(rdf_info)
 
-            # Format final context
-            context = None
-            if route_decision == "none":
-                pass
-            elif route_decision == "text":
-                context = text_context
-            elif route_decision == "lpg":
-                if lpg_nodes:
-                    context = GraphFormatter.format(
-                        nodes=lpg_nodes,
-                        edges=lpg_edges,
-                        style=experiment.config.soft_prompt_format,
-                        max_nodes=experiment.config.max_context_nodes,
-                        max_edges=experiment.config.max_context_edges,
-                    )
-            elif route_decision == "rdf":
-                if rdf_edges_raw:
-                    context = GraphFormatter.format_rdf_cleaned(
-                        rdf_edges_raw[:40]
-                    )
-            elif route_decision == "lpg_rdf":
-                if lpg_nodes or rdf_edges_raw:
-                    context = GraphFormatter.format_combined(
-                        lpg_nodes=lpg_nodes,
-                        lpg_edges=lpg_edges,
-                        rdf_edges=rdf_edges_raw,
-                        style=experiment.config.soft_prompt_format,
-                    )
+            # Context formatting (own span)
+            context = format_context(route_decision, text_context)
 
             # Build few-shot examples
             few_shot_examples = None
@@ -497,17 +524,14 @@ class OpikGraphRAGExperiment:
                     )
 
             # Agent 4: Answer Generation
-            resp = answer_generation_agent(question, context, few_shot_examples)
+            result = answer_generation_agent(question, context, few_shot_examples)
 
-            # Trace metadata
+            # Trace metadata (identifiers only — no duplication with child spans)
             opik_context.update_current_trace(
                 metadata={
                     "model": model_alias,
                     "context_mode": context_mode,
                     "few_shot": few_shot,
-                    "input_tokens": resp.input_tokens,
-                    "output_tokens": resp.output_tokens,
-                    "generation_time": resp.generation_time,
                     "question_id": question_id,
                     "category": category,
                     **subgraph_info,
@@ -520,7 +544,7 @@ class OpikGraphRAGExperiment:
             )
 
             return {
-                "output": resp.text,
+                "output": result["text"],
                 "context": [context] if context else [],
                 "input": question,
             }

@@ -29,6 +29,14 @@ from jinja2 import Template
 from openai import OpenAI
 from tqdm import tqdm
 
+try:
+    import opik
+    from opik import opik_context
+
+    _HAS_OPIK = True
+except ImportError:
+    _HAS_OPIK = False
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -170,6 +178,8 @@ class KGBuilder:
         prompts_dir: str = "prompts",
         requests_per_minute: int = 500,
         max_retries: int = 3,
+        use_opik: bool = False,
+        opik_project: str = "FinDER_KG_Build",
     ):
         client_kwargs = {"api_key": api_key}
         if api_base_url:
@@ -181,6 +191,22 @@ class KGBuilder:
         self.max_retries = max_retries
         self._request_interval = 60.0 / requests_per_minute
         self._last_request_time = 0.0
+        self._use_opik = use_opik and _HAS_OPIK
+
+        # Wrap methods with Opik tracing
+        if self._use_opik:
+            self.process_sample = opik.track(
+                name="kg_build_pipeline", project_name=opik_project
+            )(self.process_sample)
+            self.extract_entities = opik.track(
+                name="entity_extraction"
+            )(self.extract_entities)
+            self.extract_relationships = opik.track(
+                name="entity_linking"
+            )(self.extract_relationships)
+            self._to_rdf_triples = opik.track(
+                name="rdf_conversion"
+            )(self._to_rdf_triples)
 
     def _rate_limit(self) -> None:
         """Simple rate limiting via sleep."""
@@ -188,6 +214,11 @@ class KGBuilder:
         if elapsed < self._request_interval:
             time.sleep(self._request_interval - elapsed)
         self._last_request_time = time.time()
+
+    def _update_span(self, **metadata):
+        """Update current Opik span metadata (no-op when tracing disabled)."""
+        if self._use_opik:
+            opik_context.update_current_span(metadata=metadata)
 
     def _call_llm(self, system: str, user: str) -> str:
         """Call LLM API with retry. Returns raw text response."""
@@ -262,6 +293,12 @@ class KGBuilder:
                 if "name" not in n["properties"]:
                     n["properties"]["name"] = n["id"]
                 valid_nodes.append(n)
+
+        self._update_span(
+            category=category,
+            prompt_type="fibo" if category in FINANCIAL_CATEGORIES else "base",
+            entity_count=len(valid_nodes),
+        )
         return valid_nodes
 
     def extract_relationships(
@@ -285,6 +322,12 @@ class KGBuilder:
                     "properties": r.get("properties", {}),
                 }
                 valid_edges.append(edge)
+
+        self._update_span(
+            category=category,
+            prompt_type="fibo" if category in FINANCIAL_CATEGORIES else "base",
+            relationship_count=len(valid_edges),
+        )
         return valid_edges
 
     @staticmethod
@@ -363,6 +406,14 @@ class KGBuilder:
 
         # 3. Convert to RDF (deterministic)
         rdf_triples = self._to_rdf_triples(nodes, edges)
+
+        self._update_span(
+            question_id=row["_id"],
+            category=category,
+            node_count=len(nodes),
+            edge_count=len(edges),
+            rdf_triple_count=len(rdf_triples),
+        )
 
         return {
             "_id": row["_id"],
@@ -520,9 +571,23 @@ def main():
         "--merge-only", action="store_true",
         help="Skip extraction, only merge existing checkpoint into parquet",
     )
+    parser.add_argument(
+        "--no-opik", action="store_true",
+        help="Disable Opik tracing",
+    )
+    parser.add_argument(
+        "--opik-project", type=str, default="FinDER_KG_Build",
+        help="Opik project name (default: FinDER_KG_Build)",
+    )
 
     args = parser.parse_args()
     load_dotenv()
+
+    # Configure Opik tracing
+    use_opik = not args.no_opik and _HAS_OPIK
+    if use_opik:
+        opik.configure(use_local=True)
+        print(f"Opik tracing enabled (project: {args.opik_project})")
 
     # Load input
     input_path = Path(args.input)
@@ -555,6 +620,8 @@ def main():
             api_base_url=api_base,
             prompts_dir=args.prompts_dir,
             requests_per_minute=args.rpm,
+            use_opik=use_opik,
+            opik_project=args.opik_project,
         )
 
         results = builder.run(df, checkpoint, resume=args.resume)

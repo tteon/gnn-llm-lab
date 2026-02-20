@@ -35,6 +35,7 @@ from .reproducibility import (
     ExperimentTracker,
 )
 from .llm_client import LLMClient, LLMResponse
+from .vllm_metrics import VLLMMetricsCollector
 from .local_llm import LocalLLMManager, LocalLLMResponse, MODEL_REGISTRY
 from .few_shot import FewShotSelector
 from .evaluation import Evaluator, EvaluationResult
@@ -71,6 +72,8 @@ __all__ = [
     # LLM Client
     "LLMClient",
     "LLMResponse",
+    # vLLM Metrics
+    "VLLMMetricsCollector",
     # Local LLM
     "LocalLLMManager",
     "LocalLLMResponse",

@@ -24,6 +24,7 @@ import argparse
 import ast
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
@@ -38,9 +39,11 @@ from src.utils import (
     FewShotConfig,
     FewShotSelector,
     GraphFormatter,
+    LLMClient,
     LocalLLMManager,
     Neo4jClient,
     Neo4jConfig,
+    VLLMMetricsCollector,
     get_logger,
     set_seed,
     setup_logging,
@@ -126,26 +129,51 @@ class OpikGraphRAGExperiment:
         judge_model: Optional[str] = "gpt-4o-mini",
         use_judge: bool = True,
         use_bertscore: bool = True,
+        use_api: bool = False,
+        metrics_url: Optional[str] = None,
+        target_server: Optional[str] = None,
+        export_csv: bool = True,
     ):
         self.config = config
         self.opik_project = opik_project
         self.judge_model = judge_model
         self.use_judge = use_judge
         self.use_bertscore = use_bertscore
+        self.use_api = use_api
+        self.metrics_url = metrics_url
+        self.target_server = target_server
+        self.export_csv = export_csv
 
         self.local_llm: Optional[LocalLLMManager] = None
+        self.llm_api: Optional[LLMClient] = None
+        self.vllm_metrics: Optional[VLLMMetricsCollector] = None
         self.neo4j_lpg: Optional[Neo4jClient] = None
         self.neo4j_rdf: Optional[Neo4jClient] = None
         self.few_shot_selector: Optional[FewShotSelector] = None
         self.opik_client: Optional[Opik] = None
+        self.results_rows: List[Dict] = []
 
     def setup(self, contexts: Set[str]) -> None:
         """Initialize Neo4j connections, LLM manager, and Opik client."""
         mc = self.config.model
 
-        # LocalLLMManager (models loaded/unloaded per-alias in run_all)
-        self.local_llm = LocalLLMManager(mc)
-        logger.info("LocalLLMManager initialized")
+        # LLM: API or local
+        if self.use_api:
+            self.llm_api = LLMClient(
+                base_url=mc.llm_api_base_url,
+                api_key=mc.llm_api_key,
+                model=mc.llm_api_model,
+            )
+            logger.info(f"LLMClient (API) initialized: {mc.llm_api_model}")
+            if self.metrics_url:
+                self.vllm_metrics = VLLMMetricsCollector(
+                    metrics_url=self.metrics_url,
+                    target_server=self.target_server,
+                )
+                logger.info(f"VLLMMetricsCollector initialized: {self.metrics_url}")
+        else:
+            self.local_llm = LocalLLMManager(mc)
+            logger.info("LocalLLMManager initialized")
 
         # Neo4j connections
         needs_lpg = contexts & {"lpg", "lpg_rdf"}
@@ -452,26 +480,59 @@ class OpikGraphRAGExperiment:
         @opik.track(name="answer_generation_agent")
         def answer_generation_agent(question, context, few_shot_examples):
             """Generate answer using LLM with optional context and few-shot."""
-            resp = experiment.local_llm.generate(
-                question=question,
-                context=context,
-                few_shot_examples=few_shot_examples,
-                max_new_tokens=experiment.config.max_new_tokens,
-                temperature=experiment.config.temperature,
-            )
-            opik_context.update_current_span(
-                metadata={
-                    "input_tokens": resp.input_tokens,
-                    "output_tokens": resp.output_tokens,
-                    "generation_time": resp.generation_time,
-                }
-            )
+            # Pre-generation metrics snapshot
+            pre_snap = None
+            if experiment.vllm_metrics:
+                pre_snap = experiment.vllm_metrics.snapshot()
+
+            # Generate (API or local)
+            if experiment.use_api and experiment.llm_api:
+                resp = experiment.llm_api.generate(
+                    question=question,
+                    context=context,
+                    few_shot_examples=few_shot_examples,
+                    max_tokens=experiment.config.max_new_tokens,
+                    temperature=experiment.config.temperature,
+                )
+            else:
+                resp = experiment.local_llm.generate(
+                    question=question,
+                    context=context,
+                    few_shot_examples=few_shot_examples,
+                    max_new_tokens=experiment.config.max_new_tokens,
+                    temperature=experiment.config.temperature,
+                )
+
+            # Post-generation metrics snapshot + delta
+            cache_metrics = {}
+            if pre_snap and experiment.vllm_metrics:
+                post_snap = experiment.vllm_metrics.snapshot()
+                cache_metrics = experiment.vllm_metrics.delta(pre_snap, post_snap)
+
+            # cached_tokens from API response
+            cached_tokens = getattr(resp, "cached_tokens", 0)
+
+            span_metadata = {
+                "input_tokens": resp.input_tokens,
+                "output_tokens": resp.output_tokens,
+                "generation_time": resp.generation_time,
+                "cached_tokens": cached_tokens,
+            }
+            # Add cache-related Prometheus deltas
+            for k, v in cache_metrics.items():
+                if "cache" in k or "prefix" in k:
+                    span_metadata[k] = v
+
+            opik_context.update_current_span(metadata=span_metadata)
+
             return {
                 "text": resp.text,
                 "input_tokens": resp.input_tokens,
                 "output_tokens": resp.output_tokens,
                 "generation_time": resp.generation_time,
                 "model": resp.model,
+                "cached_tokens": cached_tokens,
+                "cache_metrics": cache_metrics,
             }
 
         # --- Top-level task function ---
@@ -524,7 +585,24 @@ class OpikGraphRAGExperiment:
                     )
 
             # Agent 4: Answer Generation
-            result = answer_generation_agent(question, context, few_shot_examples)
+            gen_result = answer_generation_agent(question, context, few_shot_examples)
+
+            # Accumulate raw result row for CSV export
+            experiment.results_rows.append({
+                "question_id": question_id,
+                "question": question,
+                "ground_truth": item.get("expected_output", ""),
+                "category": category,
+                "model": model_alias,
+                "context_mode": context_mode,
+                "few_shot": few_shot,
+                "response": gen_result["text"],
+                "generation_time": gen_result["generation_time"],
+                "input_tokens": gen_result["input_tokens"],
+                "output_tokens": gen_result["output_tokens"],
+                "cached_tokens": gen_result.get("cached_tokens", 0),
+                **subgraph_info,
+            })
 
             # Trace metadata (identifiers only — no duplication with child spans)
             opik_context.update_current_trace(
@@ -544,7 +622,7 @@ class OpikGraphRAGExperiment:
             )
 
             return {
-                "output": result["text"],
+                "output": gen_result["text"],
                 "context": [context] if context else [],
                 "input": question,
             }
@@ -608,8 +686,12 @@ class OpikGraphRAGExperiment:
 
         run_idx = 0
         for model_alias in models:
-            logger.info(f"Loading model: {model_alias}")
-            self.local_llm.load_model(model_alias)
+            # Load model only in local mode
+            if not self.use_api and self.local_llm:
+                logger.info(f"Loading model: {model_alias}")
+                self.local_llm.load_model(model_alias)
+            else:
+                logger.info(f"Using API model for alias: {model_alias}")
 
             for context_mode in contexts:
                 for few_shot in few_shot_flags:
@@ -638,10 +720,33 @@ class OpikGraphRAGExperiment:
                     except Exception as e:
                         logger.error(f"Failed: {experiment_name} — {e}")
 
-            self.local_llm.unload_model()
-            logger.info(f"Model unloaded: {model_alias}")
+            if not self.use_api and self.local_llm:
+                self.local_llm.unload_model()
+                logger.info(f"Model unloaded: {model_alias}")
 
         logger.info(f"All {total} experiments complete. View at Opik dashboard.")
+
+        # Export raw results CSV
+        if self.export_csv:
+            self._export_results_csv()
+
+    def _export_results_csv(self) -> Optional[Path]:
+        """Export accumulated raw results to CSV."""
+        if not self.results_rows:
+            logger.info("No results to export")
+            return None
+
+        import pandas as pd
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_dir = Path("results/experiments")
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        csv_path = results_dir / f"{timestamp}_opik_results.csv"
+        result_df = pd.DataFrame(self.results_rows)
+        result_df.to_csv(csv_path, index=False)
+        logger.info(f"Raw results exported: {csv_path} ({len(result_df)} rows)")
+        return csv_path
 
 
 # ---------------------------------------------------------------------------
@@ -710,6 +815,23 @@ def main():
         "--seed", type=int, default=42,
         help="Random seed (default: 42)",
     )
+    # API mode flags
+    parser.add_argument(
+        "--use-api", action="store_true",
+        help="Use vLLM OpenAI-compatible API instead of local model",
+    )
+    parser.add_argument(
+        "--metrics-url", type=str, default=None,
+        help="vLLM Prometheus /metrics URL (e.g. http://host:port/metrics)",
+    )
+    parser.add_argument(
+        "--target-server", type=str, default=None,
+        help="Filter Prometheus metrics by server label",
+    )
+    parser.add_argument(
+        "--no-csv", action="store_true",
+        help="Skip raw result CSV export",
+    )
 
     args = parser.parse_args()
 
@@ -751,6 +873,10 @@ def main():
         judge_model=args.judge_model,
         use_judge=not args.no_judge,
         use_bertscore=not args.no_bertscore,
+        use_api=args.use_api,
+        metrics_url=args.metrics_url,
+        target_server=args.target_server,
+        export_csv=not args.no_csv,
     )
 
     try:

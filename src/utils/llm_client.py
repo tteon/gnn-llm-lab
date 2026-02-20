@@ -26,6 +26,7 @@ class LLMResponse:
     output_tokens: int
     generation_time: float
     model: str
+    cached_tokens: int = 0
 
 
 class LLMClient:
@@ -65,6 +66,7 @@ class LLMClient:
         question: str,
         context: Optional[str] = None,
         system_prompt: Optional[str] = None,
+        few_shot_examples: Optional[list] = None,
         max_tokens: int = 256,
         temperature: float = 0.0,
     ) -> LLMResponse:
@@ -75,6 +77,7 @@ class LLMClient:
             question: The question to answer
             context: Optional context to include
             system_prompt: Optional system prompt override
+            few_shot_examples: Optional list of {"question": ..., "answer": ...} dicts
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature (0 = deterministic)
 
@@ -94,6 +97,12 @@ class LLMClient:
                 system_prompt = "You are a financial expert. Answer concisely."
 
         messages = [{"role": "system", "content": system_prompt}]
+
+        # Few-shot examples (before the actual question)
+        if few_shot_examples:
+            for ex in few_shot_examples:
+                messages.append({"role": "user", "content": ex["question"]})
+                messages.append({"role": "assistant", "content": ex["answer"]})
 
         if context:
             messages.append({
@@ -120,12 +129,18 @@ class LLMClient:
                 choice = response.choices[0]
                 usage = response.usage
 
+                # Parse cached_tokens from vLLM prompt_tokens_details
+                cached_tokens = 0
+                if usage and hasattr(usage, "prompt_tokens_details") and usage.prompt_tokens_details:
+                    cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+
                 return LLMResponse(
                     text=choice.message.content.strip() if choice.message.content else "",
                     input_tokens=usage.prompt_tokens if usage else 0,
                     output_tokens=usage.completion_tokens if usage else 0,
                     generation_time=generation_time,
                     model=response.model or self.model,
+                    cached_tokens=cached_tokens,
                 )
 
             except self.TRANSIENT_ERRORS as e:

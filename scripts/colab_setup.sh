@@ -4,19 +4,33 @@
 # =============================================================================
 #
 # Usage (in Colab cell):
+#   from google.colab import drive
+#   drive.mount('/content/drive')
 #   !git clone https://github.com/tteon/gnn-llm-lab.git
 #   %cd gnn-llm-lab
 #   !bash scripts/colab_setup.sh
 #
 # Prerequisites:
 #   - Colab with GPU runtime (T4 or A100)
-#   - Google Drive mounted at /content/drive (for data persistence)
+#   - Google Drive mounted at /content/drive
 #
-# Data flow:
-#   1. Check Drive for cached PyG data → skip processing if found
-#   2. Otherwise: download FinDER parquet from HuggingFace + build PyG dataset
-#   3. Install Python dependencies
-#   4. Ready to run notebooks/g_retrieval_comparison.ipynb
+# Drive data layout (pre-uploaded):
+#   gnnllm_lab_data/
+#   ├── raw/
+#   │   ├── FinDER.parquet              (13 MB, original HF dataset)
+#   │   └── FinDER_KG_Merged.parquet    (8.1 MB, with KG columns)
+#   └── finder_pyg/processed/
+#       ├── train.pt  (28 MB)
+#       ├── val.pt    (3.3 MB)
+#       ├── test.pt   (3.4 MB)
+#       ├── vocab.pt  (827 KB)
+#       └── metadata.json
+#
+# Data resolution order:
+#   1. Local files already present → use as-is
+#   2. Drive cache (finder_pyg/processed/) → copy .pt files
+#   3. Drive parquet (raw/) → copy + build PyG dataset
+#   4. All else fails → clear error with manual upload instructions
 # =============================================================================
 
 set -euo pipefail
@@ -44,83 +58,82 @@ echo "[2/4] Setting up project..."
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Create necessary directories
 mkdir -p data/raw data/processed/finder_pyg/processed
 
 echo "  Project root: $REPO_ROOT"
 
-# --- 3. Data: check Drive cache or download ---
+# --- 3. Data setup ---
 echo ""
 echo "[3/4] Setting up data..."
 
-DRIVE_CACHE="/content/drive/MyDrive/gnnllm_lab_data/finder_pyg/processed"
-LOCAL_DATA="data/processed/finder_pyg/processed"
-PARQUET_PATH="data/raw/FinDER_KG_Merged.parquet"
+DRIVE_BASE="/content/drive/MyDrive/gnnllm_lab_data"
+DRIVE_PYG="$DRIVE_BASE/finder_pyg/processed"
+DRIVE_RAW="$DRIVE_BASE/raw"
+LOCAL_PYG="data/processed/finder_pyg/processed"
+LOCAL_RAW="data/raw"
 
-# Check if PyG processed data exists in Drive
-if [ -d "$DRIVE_CACHE" ] && [ -f "$DRIVE_CACHE/train.pt" ]; then
-    echo "  Found cached PyG data in Drive. Copying..."
-    cp -v "$DRIVE_CACHE"/*.pt "$LOCAL_DATA/"
-    cp -v "$DRIVE_CACHE"/metadata.json "$LOCAL_DATA/" 2>/dev/null || true
-    echo "  Copied from Drive cache."
+# --- 3a. PyG processed data (.pt files) ---
+if [ -f "$LOCAL_PYG/train.pt" ]; then
+    echo "  [PyG] Already present locally."
 
-# Check if already present locally
-elif [ -f "$LOCAL_DATA/train.pt" ]; then
-    echo "  PyG data already present locally."
+elif [ -d "$DRIVE_PYG" ] && [ -f "$DRIVE_PYG/train.pt" ]; then
+    echo "  [PyG] Copying from Drive cache..."
+    cp "$DRIVE_PYG"/*.pt "$LOCAL_PYG/"
+    cp "$DRIVE_PYG"/metadata.json "$LOCAL_PYG/" 2>/dev/null || true
+    echo "  [PyG] Done. Copied from $DRIVE_PYG"
 
-else
-    echo "  No cached data found. Will build from scratch."
-    echo ""
-
-    # Download FinDER parquet from HuggingFace if needed
-    if [ ! -f "$PARQUET_PATH" ]; then
-        echo "  Downloading FinDER_KG_Merged.parquet..."
-        echo "  (If this fails, upload the parquet manually to data/raw/)"
-        pip install -q huggingface_hub
-        python3 -c "
-from huggingface_hub import hf_hub_download
-import shutil
-path = hf_hub_download(
-    repo_id='Linq-AI-Research/FinDER',
-    filename='FinDER_KG_Merged.parquet',
-    repo_type='dataset',
-)
-shutil.copy(path, 'data/raw/FinDER_KG_Merged.parquet')
-print('  Downloaded to data/raw/FinDER_KG_Merged.parquet')
-" 2>/dev/null || {
-            echo ""
-            echo "  *** HuggingFace download failed. ***"
-            echo "  Please upload FinDER_KG_Merged.parquet manually:"
-            echo "    Option A: Upload to data/raw/ in Colab file browser"
-            echo "    Option B: Mount Drive and copy from your Drive"
-            echo ""
-            echo "  Then re-run this script."
-            exit 1
-        }
+elif [ -f "$LOCAL_RAW/FinDER_KG_Merged.parquet" ] || [ -f "$DRIVE_RAW/FinDER_KG_Merged.parquet" ]; then
+    # Parquet available → build PyG dataset
+    if [ ! -f "$LOCAL_RAW/FinDER_KG_Merged.parquet" ] && [ -f "$DRIVE_RAW/FinDER_KG_Merged.parquet" ]; then
+        echo "  [Parquet] Copying from Drive..."
+        cp "$DRIVE_RAW/FinDER_KG_Merged.parquet" "$LOCAL_RAW/"
     fi
 
-    # Build PyG dataset
-    echo "  Building PyG dataset from parquet (this takes ~2 min)..."
+    echo "  [PyG] Building dataset from parquet (this takes ~2 min)..."
     python3 -c "
 import sys
 sys.path.insert(0, '.')
 from src.data import FinDERGraphQADataset
-# This triggers process() which builds train/val/test.pt + vocab.pt
 ds = FinDERGraphQADataset(root='data/processed/finder_pyg', split='train')
-print(f'  Built dataset: {len(ds)} train samples')
+print(f'  [PyG] Built dataset: {len(ds)} train samples')
 "
 
-    # Cache to Drive for next time
+    # Cache built data to Drive for next time
     if [ -d "/content/drive/MyDrive" ]; then
-        echo "  Caching PyG data to Drive for future sessions..."
-        mkdir -p "$DRIVE_CACHE"
-        cp "$LOCAL_DATA"/*.pt "$DRIVE_CACHE/"
-        cp "$LOCAL_DATA"/metadata.json "$DRIVE_CACHE/" 2>/dev/null || true
-        echo "  Cached to $DRIVE_CACHE"
+        echo "  [PyG] Caching to Drive for future sessions..."
+        mkdir -p "$DRIVE_PYG"
+        cp "$LOCAL_PYG"/*.pt "$DRIVE_PYG/"
+        cp "$LOCAL_PYG"/metadata.json "$DRIVE_PYG/" 2>/dev/null || true
     fi
+
+else
+    echo ""
+    echo "  *** ERROR: No data found! ***"
+    echo ""
+    echo "  Expected files in Google Drive (gnnllm_lab_data/):"
+    echo "    finder_pyg/processed/train.pt   (PyG dataset)"
+    echo "    raw/FinDER_KG_Merged.parquet     (source parquet)"
+    echo ""
+    echo "  Make sure Google Drive is mounted:"
+    echo "    from google.colab import drive"
+    echo "    drive.mount('/content/drive')"
+    echo ""
+    echo "  Or upload FinDER_KG_Merged.parquet manually to data/raw/"
+    echo "  and re-run this script."
+    exit 1
 fi
 
-# Verify data
+# --- 3b. Raw parquet (optional, for soft-prompt experiments) ---
+if [ ! -f "$LOCAL_RAW/FinDER_KG_Merged.parquet" ] && [ -f "$DRIVE_RAW/FinDER_KG_Merged.parquet" ]; then
+    echo "  [Parquet] Copying FinDER_KG_Merged.parquet from Drive..."
+    cp "$DRIVE_RAW/FinDER_KG_Merged.parquet" "$LOCAL_RAW/"
+fi
+if [ ! -f "$LOCAL_RAW/FinDER.parquet" ] && [ -f "$DRIVE_RAW/FinDER.parquet" ]; then
+    echo "  [Parquet] Copying FinDER.parquet from Drive..."
+    cp "$DRIVE_RAW/FinDER.parquet" "$LOCAL_RAW/"
+fi
+
+# --- 3c. Verify data ---
 echo ""
 python3 -c "
 import json
@@ -133,6 +146,16 @@ for split, n in meta['splits'].items():
 print(f'    LPG feature dim: {meta[\"lpg_feature_dim\"]}')
 print(f'    RDF entities: {meta[\"vocab_sizes\"][\"rdf_entities\"]:,}')
 print(f'    RDF relations: {meta[\"vocab_sizes\"][\"rdf_relations\"]:,}')
+
+# Check raw parquets
+import os
+for name in ['FinDER_KG_Merged.parquet', 'FinDER.parquet']:
+    path = f'data/raw/{name}'
+    if os.path.exists(path):
+        size_mb = os.path.getsize(path) / 1e6
+        print(f'    {name}: {size_mb:.1f} MB')
+    else:
+        print(f'    {name}: not present (optional)')
 "
 
 # --- 4. Verify environment ---

@@ -62,7 +62,7 @@ echo ""
 echo "[1/4] Installing dependencies..."
 pip install -q torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 pip install -q torch-geometric
-pip install -q sentence-transformers rouge-score scikit-learn scipy
+pip install -q sentence-transformers rouge-score scikit-learn scipy bitsandbytes>=0.46.1
 pip install -q pandas pyarrow matplotlib
 
 # PyG optional deps (for scatter, etc.)

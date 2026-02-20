@@ -25,6 +25,7 @@
 |------|------|------|------|
 | [experiment_design.md](design/experiment_design.md) | 709 | 확정 | 메인 실험 설계 — RQ1~3, 6가지 조건(A~D + soft/hard), 품질/latency 메트릭 |
 | [attention_experiment_design.md](design/attention_experiment_design.md) | 544 | 확정 | LPG vs RDF attention 실험 — 5 조건, 5 가설(H1~H5), attention/quality 메트릭, 구현 계획 |
+| [g_retrieval_experiment.md](design/g_retrieval_experiment.md) | 150 | 확정 | G-Retrieval 비교 실험 — GAT vs TransE vs DistMult, retrieval 평가, 카테고리 분석, 결과 해석 가이드 |
 
 ### Analysis — 실험 결과 및 데이터 분석
 
@@ -83,6 +84,8 @@
 
 | 날짜 | 변경 | 문서 |
 |------|------|------|
+| 2026-02-20 | G-Retrieval 실험 설계 문서 추가 | `design/g_retrieval_experiment.md` |
+| 2026-02-20 | README.md 전면 업데이트 (현재 아키텍처 반영) | `README.md` |
 | 2026-02-12 | 종합 보고서 작성 | `analysis/comprehensive_experiment_report.md` |
 | 2026-02-12 | MECE 카테고리 정리, INDEX.md 생성 | `docs/INDEX.md` |
 | 2026-02-12 | KNOWN_ISSUES.md 신규 생성 | `KNOWN_ISSUES.md` |

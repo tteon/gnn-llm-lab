@@ -4,15 +4,13 @@
 # =============================================================================
 #
 # Usage (in Colab cell):
-#   from google.colab import drive
-#   drive.mount('/content/drive')
 #   !git clone https://github.com/tteon/gnn-llm-lab.git
 #   %cd gnn-llm-lab
 #   !bash scripts/colab_setup.sh
 #
 # Prerequisites:
 #   - Colab with GPU runtime (T4 or A100)
-#   - Google Drive mounted at /content/drive
+#   - Google Drive login (auto-prompted by this script)
 #
 # Drive data layout (pre-uploaded):
 #   gnnllm_lab_data/
@@ -38,6 +36,23 @@ set -euo pipefail
 echo "=============================================="
 echo "  G-Retrieval Colab Setup"
 echo "=============================================="
+
+# --- 0. Mount Google Drive ---
+DRIVE_MOUNT="/content/drive"
+if [ -d "$DRIVE_MOUNT/MyDrive" ]; then
+    echo ""
+    echo "[0/4] Google Drive already mounted."
+else
+    echo ""
+    echo "[0/4] Mounting Google Drive..."
+    python3 -c "
+from google.colab import drive
+drive.mount('/content/drive')
+" || {
+        echo "  WARNING: Drive mount failed. Will proceed without Drive cache."
+        echo "  Data must be present locally or setup will fail."
+    }
+fi
 
 # --- 1. Install system + Python dependencies ---
 echo ""

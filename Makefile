@@ -1,4 +1,4 @@
-.PHONY: all pipeline download build-kg load-neo4j experiment setup clean-intermediate clean lint test
+.PHONY: all pipeline download build-kg load-neo4j build-pyg experiment setup clean-intermediate clean lint test
 
 # Full pipeline: download → extract → merge → load Neo4j
 pipeline: download build-kg load-neo4j
@@ -27,6 +27,10 @@ load-neo4j:
 	@echo "Waiting for Neo4j to start..."
 	sleep 10
 	uv run python src/load_finder_kg.py
+
+# Stage 4: Build PyG dataset (LPG + RDF dual-graph per question)
+build-pyg:
+	uv run python scripts/build_pyg_dataset.py
 
 # Run Opik experiment
 experiment:

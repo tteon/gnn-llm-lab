@@ -17,12 +17,15 @@
 #   ├── raw/
 #   │   ├── FinDER.parquet              (13 MB, original HF dataset)
 #   │   └── FinDER_KG_Merged.parquet    (8.1 MB, with KG columns)
-#   └── finder_pyg/processed/
-#       ├── train.pt  (28 MB)
-#       ├── val.pt    (3.3 MB)
-#       ├── test.pt   (3.4 MB)
-#       ├── vocab.pt  (827 KB)
-#       └── metadata.json
+#   ├── finder_pyg/processed/
+#   │   ├── train.pt  (28 MB)
+#   │   ├── val.pt    (3.3 MB)
+#   │   ├── test.pt   (3.4 MB)
+#   │   ├── vocab.pt  (827 KB)
+#   │   └── metadata.json
+#   └── processed/
+#       ├── lpg_full_graph.pt           (23 MB, global LPG node features)
+#       └── rdf_triples.pt             (977 KB, global RDF triples)
 #
 # Data resolution order:
 #   1. Local files already present → use as-is
@@ -148,7 +151,18 @@ if [ ! -f "$LOCAL_RAW/FinDER.parquet" ] && [ -f "$DRIVE_RAW/FinDER.parquet" ]; t
     cp "$DRIVE_RAW/FinDER.parquet" "$LOCAL_RAW/"
 fi
 
-# --- 3c. Verify data ---
+# --- 3c. Global graph files (for profiling / CPU store simulation) ---
+DRIVE_PROCESSED="$DRIVE_BASE/processed"
+LOCAL_PROCESSED="data/processed"
+
+for pt_file in lpg_full_graph.pt rdf_triples.pt; do
+    if [ ! -f "$LOCAL_PROCESSED/$pt_file" ] && [ -f "$DRIVE_PROCESSED/$pt_file" ]; then
+        echo "  [Processed] Copying $pt_file from Drive..."
+        cp "$DRIVE_PROCESSED/$pt_file" "$LOCAL_PROCESSED/"
+    fi
+done
+
+# --- 3d. Verify data ---
 echo ""
 python3 -c "
 import json
@@ -171,6 +185,15 @@ for name in ['FinDER_KG_Merged.parquet', 'FinDER.parquet']:
         print(f'    {name}: {size_mb:.1f} MB')
     else:
         print(f'    {name}: not present (optional)')
+
+# Check global graph files
+for name in ['lpg_full_graph.pt', 'rdf_triples.pt']:
+    path = f'data/processed/{name}'
+    if os.path.exists(path):
+        size_mb = os.path.getsize(path) / 1e6
+        print(f'    {name}: {size_mb:.1f} MB')
+    else:
+        print(f'    {name}: not present (will reconstruct from dataset)')
 "
 
 # --- 4. Verify environment ---
